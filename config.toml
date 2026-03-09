@@ -1,0 +1,8 @@
+[listen]
+address = "127.0.0.1"
+port = 5353
+
+[upstream]
+address = "8.8.8.8"
+port = 53
+timeout_ms = 5000

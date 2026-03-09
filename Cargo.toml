@@ -1,0 +1,18 @@
+[package]
+name = "dnsink"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance DNS proxy that blocks malware, C2, and phishing at the DNS layer"
+authors = ["Joel Libni <kakarot.joel@gmail.com>"]
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hickory-proto = "0.25"
+hickory-resolver = "0.25"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
