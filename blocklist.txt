@@ -1,0 +1,4 @@
+# Example blocklist — one domain per line
+malware.example.com
+evil.example.com
+tracker.adnetwork.com

@@ -6,3 +6,6 @@ port = 5353
 address = "8.8.8.8"
 port = 53
 timeout_ms = 5000
+
+[blocklist]
+path = "blocklist.txt"

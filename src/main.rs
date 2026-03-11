@@ -1,12 +1,15 @@
+mod bloom;
 mod config;
 mod proxy;
 
+use std::io::BufRead;
 use std::path::PathBuf;
 
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use bloom::BloomFilter;
 use config::Config;
 use proxy::DnsProxy;
 
@@ -40,6 +43,37 @@ async fn main() -> anyhow::Result<()> {
         "starting dnsink"
     );
 
-    let proxy = DnsProxy::new(config);
+    let blocklist = load_blocklist(&config)?;
+    let proxy = DnsProxy::new(config, blocklist);
     proxy.run().await
+}
+
+fn load_blocklist(config: &Config) -> anyhow::Result<Option<BloomFilter>> {
+    let bl_config = match &config.blocklist {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let file = std::fs::File::open(&bl_config.path)?;
+    let domains: Vec<String> = std::io::BufReader::new(file)
+        .lines()
+        .filter_map(|line| {
+            let line = line.ok()?;
+            let trimmed = line.trim().to_lowercase();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(trimmed.trim_end_matches('.').to_string())
+            }
+        })
+        .collect();
+
+    let count = domains.len();
+    let mut bloom = BloomFilter::new(count.max(1), 0.01);
+    for domain in &domains {
+        bloom.insert(domain);
+    }
+
+    info!(domains = count, path = %bl_config.path, "loaded blocklist into bloom filter");
+    Ok(Some(bloom))
 }

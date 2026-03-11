@@ -7,6 +7,13 @@ use serde::Deserialize;
 pub struct Config {
     pub listen: ListenConfig,
     pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub blocklist: Option<BlocklistConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlocklistConfig {
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +53,7 @@ impl Default for Config {
                 port: 53,
                 timeout_ms: 5000,
             },
+            blocklist: None,
         }
     }
 }
