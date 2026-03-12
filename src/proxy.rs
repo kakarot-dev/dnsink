@@ -10,13 +10,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::bloom::BloomFilter;
 use crate::config::Config;
+use crate::trie::DomainTrie;
 
 /// Maximum DNS message size with EDNS0 support
 const MAX_DNS_MSG_SIZE: usize = 4096;
 
 struct Shared {
     config: Config,
-    blocklist: Option<BloomFilter>,
+    bloom: Option<BloomFilter>,
+    trie: DomainTrie,
 }
 
 pub struct DnsProxy {
@@ -24,9 +26,9 @@ pub struct DnsProxy {
 }
 
 impl DnsProxy {
-    pub fn new(config: Config, blocklist: Option<BloomFilter>) -> Self {
+    pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> Self {
         Self {
-            shared: Arc::new(Shared { config, blocklist }),
+            shared: Arc::new(Shared { config, bloom, trie }),
         }
     }
 
@@ -75,7 +77,7 @@ impl DnsProxy {
 
             Self::log_query(&query_data, src, "udp");
 
-            if let Some(nxdomain) = Self::check_blocklist(&query_data, &shared.blocklist) {
+            if let Some(nxdomain) = Self::check_blocklist(&query_data, &shared.bloom, &shared.trie) {
                 let _ = socket.send_to(&nxdomain, src).await;
                 continue;
             }
@@ -106,7 +108,7 @@ impl DnsProxy {
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_tcp_client(stream, src, upstream_addr, timeout, &shared.blocklist).await {
+                if let Err(e) = Self::handle_tcp_client(stream, src, upstream_addr, timeout, &shared.bloom, &shared.trie).await {
                     warn!(src = %src, error = %e, "TCP client failed");
                 }
             });
@@ -123,7 +125,8 @@ impl DnsProxy {
         src: SocketAddr,
         upstream: SocketAddr,
         timeout: Duration,
-        blocklist: &Option<BloomFilter>,
+        bloom: &Option<BloomFilter>,
+        trie: &DomainTrie,
     ) -> anyhow::Result<()> {
         // Read 2-byte length prefix
         let msg_len = stream.read_u16().await? as usize;
@@ -138,7 +141,7 @@ impl DnsProxy {
         Self::log_query(&query_data, src, "tcp");
 
         // Check blocklist before forwarding
-        if let Some(nxdomain) = Self::check_blocklist(&query_data, blocklist) {
+        if let Some(nxdomain) = Self::check_blocklist(&query_data, bloom, trie) {
             let len_bytes = (nxdomain.len() as u16).to_be_bytes();
             stream.write_all(&len_bytes).await?;
             stream.write_all(&nxdomain).await?;
@@ -202,14 +205,27 @@ impl DnsProxy {
         Ok(response)
     }
 
-    fn check_blocklist(query_data: &[u8], blocklist: &Option<BloomFilter>) -> Option<Vec<u8>> {
-        let bl = blocklist.as_ref()?;
+    fn check_blocklist(
+        query_data: &[u8],
+        bloom: &Option<BloomFilter>,
+        trie: &DomainTrie,
+    ) -> Option<Vec<u8>> {
         let message = Message::from_bytes(query_data).ok()?;
         let query = message.queries().first()?;
         let domain = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
 
-        if bl.contains(&domain) {
-            debug!(domain = %domain, "blocked by bloom filter");
+        // Stage 1: bloom pre-filter — check domain and each parent label.
+        // A miss on every ancestor means definitely not blocked; skip the trie.
+        if let Some(bl) = bloom {
+            let maybe_blocked = Self::ancestors(&domain).any(|d| bl.contains(&d));
+            if !maybe_blocked {
+                return None;
+            }
+        }
+
+        // Stage 2: trie is authoritative — handles exact matches and wildcards.
+        if trie.contains(&domain) {
+            debug!(domain = %domain, "blocked");
             let mut response = message.clone();
             response.set_message_type(MessageType::Response);
             response.set_response_code(ResponseCode::NXDomain);
@@ -220,6 +236,11 @@ impl DnsProxy {
         } else {
             None
         }
+    }
+
+    /// Yields the domain and each parent: "a.b.com" → "a.b.com", "b.com", "com"
+    fn ancestors(domain: &str) -> impl Iterator<Item = &str> {
+        std::iter::successors(Some(domain), |d| d.find('.').map(|i| &d[i + 1..]))
     }
 
     fn log_query(data: &[u8], src: SocketAddr, proto: &str) {

@@ -1,6 +1,7 @@
 mod bloom;
 mod config;
 mod proxy;
+mod trie;
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use bloom::BloomFilter;
 use config::Config;
 use proxy::DnsProxy;
+use trie::DomainTrie;
 
 #[derive(Parser)]
 #[command(name = "dnsink", about = "DNS threat gateway")]
@@ -43,15 +45,17 @@ async fn main() -> anyhow::Result<()> {
         "starting dnsink"
     );
 
-    let blocklist = load_blocklist(&config)?;
-    let proxy = DnsProxy::new(config, blocklist);
+    let (bloom, trie) = load_blocklist(&config)?;
+    let proxy = DnsProxy::new(config, bloom, trie);
     proxy.run().await
 }
 
-fn load_blocklist(config: &Config) -> anyhow::Result<Option<BloomFilter>> {
+fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>, DomainTrie)> {
+    let mut trie = DomainTrie::new();
+
     let bl_config = match &config.blocklist {
         Some(c) => c,
-        None => return Ok(None),
+        None => return Ok((None, trie)),
     };
 
     let file = std::fs::File::open(&bl_config.path)?;
@@ -72,8 +76,9 @@ fn load_blocklist(config: &Config) -> anyhow::Result<Option<BloomFilter>> {
     let mut bloom = BloomFilter::new(count.max(1), 0.01);
     for domain in &domains {
         bloom.insert(domain);
+        trie.insert(domain);
     }
 
-    info!(domains = count, path = %bl_config.path, "loaded blocklist into bloom filter");
-    Ok(Some(bloom))
+    info!(domains = count, path = %bl_config.path, "loaded blocklist");
+    Ok((Some(bloom), trie))
 }
