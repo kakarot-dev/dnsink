@@ -1,5 +1,6 @@
 mod bloom;
 mod config;
+mod feeds;
 mod proxy;
 mod trie;
 
@@ -45,40 +46,54 @@ async fn main() -> anyhow::Result<()> {
         "starting dnsink"
     );
 
-    let (bloom, trie) = load_blocklist(&config)?;
+    let (bloom, trie) = load_blocklist(&config).await?;
     let proxy = DnsProxy::new(config, bloom, trie);
     proxy.run().await
 }
 
-fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>, DomainTrie)> {
+async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>, DomainTrie)> {
+    let mut domains: Vec<String> = Vec::new();
+
+    // Static file
+    if let Some(bl_config) = &config.blocklist {
+        let file = std::fs::File::open(&bl_config.path)?;
+        let file_domains = std::io::BufReader::new(file)
+            .lines()
+            .filter_map(|line| {
+                let line = line.ok()?;
+                let trimmed = line.trim().to_lowercase();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    None
+                } else {
+                    Some(trimmed.trim_end_matches('.').to_string())
+                }
+            });
+        domains.extend(file_domains);
+        info!(path = %bl_config.path, "loaded static blocklist");
+    }
+
+    // URLhaus live feed
+    match feeds::fetch_urlhaus().await {
+        Ok(feed) => {
+            info!(domains = feed.len(), "fetched URLhaus feed");
+            domains.extend(feed);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to fetch URLhaus feed, continuing without it");
+        }
+    }
+
+    if domains.is_empty() {
+        return Ok((None, DomainTrie::new()));
+    }
+
+    let mut bloom = BloomFilter::new(domains.len(), 0.01);
     let mut trie = DomainTrie::new();
-
-    let bl_config = match &config.blocklist {
-        Some(c) => c,
-        None => return Ok((None, trie)),
-    };
-
-    let file = std::fs::File::open(&bl_config.path)?;
-    let domains: Vec<String> = std::io::BufReader::new(file)
-        .lines()
-        .filter_map(|line| {
-            let line = line.ok()?;
-            let trimmed = line.trim().to_lowercase();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                Some(trimmed.trim_end_matches('.').to_string())
-            }
-        })
-        .collect();
-
-    let count = domains.len();
-    let mut bloom = BloomFilter::new(count.max(1), 0.01);
     for domain in &domains {
         bloom.insert(domain);
         trie.insert(domain);
     }
 
-    info!(domains = count, path = %bl_config.path, "loaded blocklist");
+    info!(total = domains.len(), "blocklist ready");
     Ok((Some(bloom), trie))
 }
