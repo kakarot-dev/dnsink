@@ -72,15 +72,11 @@ async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>,
         info!(path = %bl_config.path, "loaded static blocklist");
     }
 
-    // URLhaus live feed
-    match feeds::fetch_urlhaus().await {
-        Ok(feed) => {
-            info!(domains = feed.len(), "fetched URLhaus feed");
-            domains.extend(feed);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to fetch URLhaus feed, continuing without it");
-        }
+    // Live threat feeds
+    load_feed(&feeds::UrlHausFeed, &mut domains).await;
+    load_feed(&feeds::OpenPhishFeed, &mut domains).await;
+    if let Some(key) = &config.feeds.phishtank_api_key {
+        load_feed(&feeds::PhishTankFeed { api_key: key.clone() }, &mut domains).await;
     }
 
     if domains.is_empty() {
@@ -96,4 +92,17 @@ async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>,
 
     info!(total = domains.len(), "blocklist ready");
     Ok((Some(bloom), trie))
+}
+
+async fn load_feed(feed: &impl feeds::ThreatFeed, domains: &mut Vec<String>) {
+    match feed.fetch().await {
+        Ok(raw) => {
+            let parsed = feed.parse(&raw);
+            info!(feed = feed.name(), domains = parsed.len(), "fetched feed");
+            domains.extend(parsed);
+        }
+        Err(e) => {
+            tracing::warn!(feed = feed.name(), error = %e, "failed to fetch feed, skipping");
+        }
+    }
 }

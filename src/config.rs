@@ -9,6 +9,13 @@ pub struct Config {
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub blocklist: Option<BlocklistConfig>,
+    #[serde(default)]
+    pub feeds: FeedsConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FeedsConfig {
+    pub phishtank_api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +61,7 @@ impl Default for Config {
                 timeout_ms: 5000,
             },
             blocklist: None,
+            feeds: FeedsConfig::default(),
         }
     }
 }

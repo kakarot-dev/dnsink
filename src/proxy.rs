@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -71,14 +71,16 @@ impl DnsProxy {
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
             let query_data = buf[..len].to_vec();
+            let start = Instant::now();
 
             let upstream_addr = shared.config.upstream_addr()?;
             let timeout = Duration::from_millis(shared.config.upstream.timeout_ms);
 
-            Self::log_query(&query_data, src, "udp");
+            let (domain, nxdomain) = Self::check_blocklist(&query_data, &shared.bloom, &shared.trie);
 
-            if let Some(nxdomain) = Self::check_blocklist(&query_data, &shared.bloom, &shared.trie) {
-                let _ = socket.send_to(&nxdomain, src).await;
+            if let Some(nxdomain_bytes) = nxdomain {
+                let _ = socket.send_to(&nxdomain_bytes, src).await;
+                Self::log_outcome(src, &domain, "blocked", start.elapsed().as_millis(), "udp");
                 continue;
             }
 
@@ -91,6 +93,7 @@ impl DnsProxy {
                     if let Err(e) = socket.send_to(&response_data, src).await {
                         error!(src = %src, error = %e, "failed to send response");
                     }
+                    Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), "udp");
                 }
                 Err(e) => {
                     warn!(src = %src, error = %e, "upstream query failed");
@@ -137,14 +140,15 @@ impl DnsProxy {
         // Read the DNS message
         let mut query_data = vec![0u8; msg_len];
         stream.read_exact(&mut query_data).await?;
+        let start = Instant::now();
 
-        Self::log_query(&query_data, src, "tcp");
+        let (domain, nxdomain) = Self::check_blocklist(&query_data, bloom, trie);
 
-        // Check blocklist before forwarding
-        if let Some(nxdomain) = Self::check_blocklist(&query_data, bloom, trie) {
-            let len_bytes = (nxdomain.len() as u16).to_be_bytes();
+        if let Some(nxdomain_bytes) = nxdomain {
+            let len_bytes = (nxdomain_bytes.len() as u16).to_be_bytes();
             stream.write_all(&len_bytes).await?;
-            stream.write_all(&nxdomain).await?;
+            stream.write_all(&nxdomain_bytes).await?;
+            Self::log_outcome(src, &domain, "blocked", start.elapsed().as_millis(), "tcp");
             return Ok(());
         }
 
@@ -166,6 +170,7 @@ impl DnsProxy {
         let len_bytes = (response_data.len() as u16).to_be_bytes();
         stream.write_all(&len_bytes).await?;
         stream.write_all(&response_data).await?;
+        Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), "tcp");
 
         Ok(())
     }
@@ -205,13 +210,18 @@ impl DnsProxy {
         Ok(response)
     }
 
+    /// Returns the queried domain and, if blocked, the NXDOMAIN response bytes.
     fn check_blocklist(
         query_data: &[u8],
         bloom: &Option<BloomFilter>,
         trie: &DomainTrie,
-    ) -> Option<Vec<u8>> {
-        let message = Message::from_bytes(query_data).ok()?;
-        let query = message.queries().first()?;
+    ) -> (String, Option<Vec<u8>>) {
+        let Some(message) = Message::from_bytes(query_data).ok() else {
+            return (String::new(), None);
+        };
+        let Some(query) = message.queries().first() else {
+            return (String::new(), None);
+        };
         let domain = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
 
         // Stage 1: bloom pre-filter — check domain and each parent label.
@@ -219,22 +229,22 @@ impl DnsProxy {
         if let Some(bl) = bloom {
             let maybe_blocked = Self::ancestors(&domain).any(|d| bl.contains(&d));
             if !maybe_blocked {
-                return None;
+                return (domain, None);
             }
         }
 
         // Stage 2: trie is authoritative — handles exact matches and wildcards.
         if trie.contains(&domain) {
-            debug!(domain = %domain, "blocked");
             let mut response = message.clone();
             response.set_message_type(MessageType::Response);
             response.set_response_code(ResponseCode::NXDomain);
             response.take_answers();
             response.take_additionals();
             response.take_name_servers();
-            Some(response.to_bytes().ok()?)
+            let bytes = response.to_bytes().ok();
+            (domain, bytes)
         } else {
-            None
+            (domain, None)
         }
     }
 
@@ -243,17 +253,14 @@ impl DnsProxy {
         std::iter::successors(Some(domain), |d| d.find('.').map(|i| &d[i + 1..]))
     }
 
-    fn log_query(data: &[u8], src: SocketAddr, proto: &str) {
-        if let Ok(message) = Message::from_bytes(data) {
-            if let Some(query) = message.queries().first() {
-                debug!(
-                    domain = %query.name(),
-                    qtype = %query.query_type(),
-                    src = %src,
-                    proto,
-                    "query"
-                );
-            }
-        }
+    fn log_outcome(src: SocketAddr, domain: &str, action: &str, latency_ms: u128, proto: &str) {
+        info!(
+            src = %src,
+            domain = %domain,
+            action = %action,
+            latency_ms = %latency_ms,
+            proto = %proto,
+            "query"
+        );
     }
 }
