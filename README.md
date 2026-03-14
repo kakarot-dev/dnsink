@@ -26,7 +26,7 @@ Client query (UDP/TCP)
         ▼
 ┌───────────────┐
 │ BloomFilter   │  stage 1: check queried domain + each parent label
-│  (100K items) │  O(k) bit lookups — ~96 ns hit, ~160 ns miss
+│  (100K items) │  O(k) bit lookups — ~89 ns hit, ~158 ns miss
 │   ~120 KB     │  definite miss → skip trie, forward immediately
 └───────┬───────┘
         │ maybe blocked
@@ -114,11 +114,11 @@ Measured with Criterion on 100,000 domains, release build.
 | Two-stage lookup — hit | 449 ns |
 | Two-stage lookup — miss | 294 ns |
 
-**Why bloom miss is slower than hit:** on a hit, all `k` bits are set so the loop may return early. On a miss, all `k` positions must be checked before returning false.
+**Why bloom miss is slower than hit:** on a hit, all `k` positions must return 1 — the loop checks every hash. On a miss, the real-world slowdown comes from cache pressure: missed domains scatter to cold bit positions the CPU hasn't recently accessed.
 
 **Why wildcard hit is faster than exact hit:** `is_blocked` is checked before descending to the next label. A blocked parent (`malware.com`) short-circuits immediately — the trie never walks to the leaf node.
 
-**Two-stage miss (302 ns):** bloom eliminates the miss in ~160 ns; the trie is never consulted. This is the common case for legitimate traffic.
+**Two-stage miss (294 ns):** bloom eliminates the miss in ~158 ns; the trie is never consulted. This is the common case for legitimate traffic.
 
 ## Configuration
 
