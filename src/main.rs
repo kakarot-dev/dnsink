@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         listen = %format!("{}:{}", config.listen.address, config.listen.port),
         upstream = %format!("{}:{}", config.upstream.address, config.upstream.port),
+        refresh_secs = config.feeds.refresh_secs,
         "starting dnsink"
     );
 
@@ -70,9 +71,13 @@ async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>,
         info!(path = %bl_config.path, "loaded static blocklist");
     }
 
-    // Live threat feeds
-    load_feed(&feeds::UrlHausFeed, &mut domains).await;
-    load_feed(&feeds::OpenPhishFeed, &mut domains).await;
+    // Live threat feeds (configurable)
+    if config.feeds.urlhaus {
+        load_feed(&feeds::UrlHausFeed, &mut domains).await;
+    }
+    if config.feeds.openphish {
+        load_feed(&feeds::OpenPhishFeed, &mut domains).await;
+    }
     if let Some(key) = &config.feeds.phishtank_api_key {
         load_feed(
             &feeds::PhishTankFeed {

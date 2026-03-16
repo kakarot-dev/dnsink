@@ -15,7 +15,22 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct FeedsConfig {
+    #[serde(default = "default_true")]
+    pub urlhaus: bool,
+    #[serde(default = "default_true")]
+    pub openphish: bool,
     pub phishtank_api_key: Option<String>,
+    /// Interval in seconds to re-fetch feeds (used by hot-reload)
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_refresh_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +76,12 @@ impl Default for Config {
                 timeout_ms: 5000,
             },
             blocklist: None,
-            feeds: FeedsConfig::default(),
+            feeds: FeedsConfig {
+                urlhaus: true,
+                openphish: true,
+                phishtank_api_key: None,
+                refresh_secs: 3600,
+            },
         }
     }
 }
