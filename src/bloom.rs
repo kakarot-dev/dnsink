@@ -12,7 +12,7 @@ impl BloomFilter {
         let m = optimal_m(expected_items, fp_rate);
         let k = optimal_k(m, expected_items);
         BloomFilter {
-            bits: vec![0u8; (m + 7) / 8],
+            bits: vec![0u8; m.div_ceil(8)],
             m,
             k,
         }
@@ -104,9 +104,7 @@ mod tests {
         }
 
         let test_count = 10_000;
-        let false_positives = (n..n + test_count)
-            .filter(|i| bf.contains(i))
-            .count();
+        let false_positives = (n..n + test_count).filter(|i| bf.contains(i)).count();
 
         let observed_fp = false_positives as f64 / test_count as f64;
         assert!(
@@ -135,6 +133,9 @@ mod tests {
         let bf = BloomFilter::new(100_000, 0.01);
         let bytes = bf.bits.len();
         // ~120KB for 100K items at 1% FP, not ~960KB
-        assert!(bytes < 150_000, "bit vector uses {bytes} bytes, expected ~120KB");
+        assert!(
+            bytes < 150_000,
+            "bit vector uses {bytes} bytes, expected ~120KB"
+        );
     }
 }

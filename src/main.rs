@@ -57,17 +57,15 @@ async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>,
     // Static file
     if let Some(bl_config) = &config.blocklist {
         let file = std::fs::File::open(&bl_config.path)?;
-        let file_domains = std::io::BufReader::new(file)
-            .lines()
-            .filter_map(|line| {
-                let line = line.ok()?;
-                let trimmed = line.trim().to_lowercase();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    None
-                } else {
-                    Some(trimmed.trim_end_matches('.').to_string())
-                }
-            });
+        let file_domains = std::io::BufReader::new(file).lines().filter_map(|line| {
+            let line = line.ok()?;
+            let trimmed = line.trim().to_lowercase();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(trimmed.trim_end_matches('.').to_string())
+            }
+        });
         domains.extend(file_domains);
         info!(path = %bl_config.path, "loaded static blocklist");
     }
@@ -76,7 +74,13 @@ async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>,
     load_feed(&feeds::UrlHausFeed, &mut domains).await;
     load_feed(&feeds::OpenPhishFeed, &mut domains).await;
     if let Some(key) = &config.feeds.phishtank_api_key {
-        load_feed(&feeds::PhishTankFeed { api_key: key.clone() }, &mut domains).await;
+        load_feed(
+            &feeds::PhishTankFeed {
+                api_key: key.clone(),
+            },
+            &mut domains,
+        )
+        .await;
     }
 
     if domains.is_empty() {

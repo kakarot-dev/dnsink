@@ -28,7 +28,11 @@ pub struct DnsProxy {
 impl DnsProxy {
     pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> Self {
         Self {
-            shared: Arc::new(Shared { config, bloom, trie }),
+            shared: Arc::new(Shared {
+                config,
+                bloom,
+                trie,
+            }),
         }
     }
 
@@ -76,7 +80,8 @@ impl DnsProxy {
             let upstream_addr = shared.config.upstream_addr()?;
             let timeout = Duration::from_millis(shared.config.upstream.timeout_ms);
 
-            let (domain, nxdomain) = Self::check_blocklist(&query_data, &shared.bloom, &shared.trie);
+            let (domain, nxdomain) =
+                Self::check_blocklist(&query_data, &shared.bloom, &shared.trie);
 
             if let Some(nxdomain_bytes) = nxdomain {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
@@ -111,7 +116,16 @@ impl DnsProxy {
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_tcp_client(stream, src, upstream_addr, timeout, &shared.bloom, &shared.trie).await {
+                if let Err(e) = Self::handle_tcp_client(
+                    stream,
+                    src,
+                    upstream_addr,
+                    timeout,
+                    &shared.bloom,
+                    &shared.trie,
+                )
+                .await
+                {
                     warn!(src = %src, error = %e, "TCP client failed");
                 }
             });
@@ -161,8 +175,7 @@ impl DnsProxy {
         if let Ok(msg) = Message::from_bytes(&response_data) {
             if msg.truncated() {
                 debug!(src = %src, "upstream response truncated, retrying over TCP");
-                response_data =
-                    Self::forward_tcp(&query_data, upstream, timeout).await?;
+                response_data = Self::forward_tcp(&query_data, upstream, timeout).await?;
             }
         }
 
@@ -222,7 +235,12 @@ impl DnsProxy {
         let Some(query) = message.queries().first() else {
             return (String::new(), None);
         };
-        let domain = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
+        let domain = query
+            .name()
+            .to_ascii()
+            .to_lowercase()
+            .trim_end_matches('.')
+            .to_string();
 
         // Stage 1: bloom pre-filter — check domain and each parent label.
         // A miss on every ancestor means definitely not blocked; skip the trie.

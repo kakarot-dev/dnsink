@@ -5,7 +5,9 @@ use dnsink::trie::DomainTrie;
 const N: usize = 100_000;
 
 fn make_domains(n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("domain-{i}.malware.example.com")).collect()
+    (0..n)
+        .map(|i| format!("domain-{i}.malware.example.com"))
+        .collect()
 }
 
 // --- Bloom filter ---
@@ -108,7 +110,11 @@ fn bench_two_stage(c: &mut Criterion) {
             let domain = &domains[i % N];
             i += 1;
             let maybe = ancestors(black_box(domain)).any(|d| bloom.contains(&d));
-            if maybe { trie.contains(black_box(domain)) } else { false }
+            if maybe {
+                trie.contains(black_box(domain))
+            } else {
+                false
+            }
         });
     });
 
@@ -118,7 +124,11 @@ fn bench_two_stage(c: &mut Criterion) {
             let domain = format!("nothere-{i}.clean.com");
             i += 1;
             let maybe = ancestors(black_box(&domain)).any(|d| bloom.contains(&d));
-            if maybe { trie.contains(black_box(&domain)) } else { false }
+            if maybe {
+                trie.contains(black_box(&domain))
+            } else {
+                false
+            }
         });
     });
 

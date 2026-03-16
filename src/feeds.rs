@@ -30,11 +30,15 @@ pub struct UrlHausFeed;
 const URLHAUS_URL: &str = "https://urlhaus.abuse.ch/downloads/text/";
 
 impl ThreatFeed for UrlHausFeed {
-    fn name(&self) -> &str { "URLhaus" }
+    fn name(&self) -> &str {
+        "URLhaus"
+    }
     async fn fetch(&self) -> anyhow::Result<String> {
         Ok(reqwest::get(URLHAUS_URL).await?.text().await?)
     }
-    fn parse(&self, raw: &str) -> Vec<String> { parse_url_list(raw) }
+    fn parse(&self, raw: &str) -> Vec<String> {
+        parse_url_list(raw)
+    }
 }
 
 // --- OpenPhish ---
@@ -44,11 +48,15 @@ pub struct OpenPhishFeed;
 const OPENPHISH_URL: &str = "https://openphish.com/feed.txt";
 
 impl ThreatFeed for OpenPhishFeed {
-    fn name(&self) -> &str { "OpenPhish" }
+    fn name(&self) -> &str {
+        "OpenPhish"
+    }
     async fn fetch(&self) -> anyhow::Result<String> {
         Ok(reqwest::get(OPENPHISH_URL).await?.text().await?)
     }
-    fn parse(&self, raw: &str) -> Vec<String> { parse_url_list(raw) }
+    fn parse(&self, raw: &str) -> Vec<String> {
+        parse_url_list(raw)
+    }
 }
 
 // --- PhishTank ---
@@ -58,10 +66,15 @@ pub struct PhishTankFeed {
 }
 
 impl ThreatFeed for PhishTankFeed {
-    fn name(&self) -> &str { "PhishTank" }
+    fn name(&self) -> &str {
+        "PhishTank"
+    }
 
     async fn fetch(&self) -> anyhow::Result<String> {
-        let url = format!("https://data.phishtank.com/data/{}/online-valid.json", self.api_key);
+        let url = format!(
+            "https://data.phishtank.com/data/{}/online-valid.json",
+            self.api_key
+        );
         Ok(reqwest::get(&url).await?.text().await?)
     }
 
@@ -93,7 +106,11 @@ fn extract_host(url: &str) -> Option<String> {
     let host = after_scheme.split('/').next()?;
     let host = host.split(':').next()?;
     let host = host.trim().to_lowercase();
-    if host.is_empty() { None } else { Some(host) }
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 #[cfg(test)]
@@ -102,17 +119,26 @@ mod tests {
 
     #[test]
     fn extracts_plain_host() {
-        assert_eq!(extract_host("http://malware.example.com/payload"), Some("malware.example.com".into()));
+        assert_eq!(
+            extract_host("http://malware.example.com/payload"),
+            Some("malware.example.com".into())
+        );
     }
 
     #[test]
     fn extracts_host_with_port() {
-        assert_eq!(extract_host("http://malware.example.com:8080/payload"), Some("malware.example.com".into()));
+        assert_eq!(
+            extract_host("http://malware.example.com:8080/payload"),
+            Some("malware.example.com".into())
+        );
     }
 
     #[test]
     fn extracts_https_host() {
-        assert_eq!(extract_host("https://evil.co.uk/drop"), Some("evil.co.uk".into()));
+        assert_eq!(
+            extract_host("https://evil.co.uk/drop"),
+            Some("evil.co.uk".into())
+        );
     }
 
     #[test]
@@ -134,14 +160,19 @@ mod tests {
             {"url": "http://phish.example.com/steal", "phish_id": "2"},
             {"url": "https://other.net/fake", "phish_id": "3"}
         ]"#;
-        let feed = PhishTankFeed { api_key: String::new() };
+        let feed = PhishTankFeed {
+            api_key: String::new(),
+        };
         let domains = feed.parse(raw);
         assert_eq!(domains, vec!["phish.example.com", "other.net"]);
     }
 
     #[test]
     fn phishtank_parse_handles_invalid_json() {
-        let domains = PhishTankFeed { api_key: String::new() }.parse("not json");
+        let domains = PhishTankFeed {
+            api_key: String::new(),
+        }
+        .parse("not json");
         assert!(domains.is_empty());
     }
 }

@@ -18,15 +18,26 @@ pub struct DomainTrie {
     root: TrieNode,
 }
 
+impl Default for DomainTrie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DomainTrie {
     pub fn new() -> Self {
-        Self { root: TrieNode::new() }
+        Self {
+            root: TrieNode::new(),
+        }
     }
 
     pub fn insert(&mut self, domain: &str) {
         let mut node = &mut self.root;
         for label in domain.split('.').rev() {
-            node = node.children.entry(label.to_string()).or_insert_with(TrieNode::new);
+            node = node
+                .children
+                .entry(label.to_string())
+                .or_insert_with(TrieNode::new);
         }
         node.is_blocked = true;
     }
