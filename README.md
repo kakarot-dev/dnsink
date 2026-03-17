@@ -7,8 +7,10 @@ A high-performance DNS proxy that blocks malware, C2, and phishing domains at th
 - Blocks malware and phishing domains via live threat feeds (URLhaus, OpenPhish)
 - Wildcard blocking: block `malware.com` and all subdomains automatically
 - Two-stage lookup: bloom filter pre-screens, radix trie confirms
+- Hot-reload: blocklists refresh on a configurable interval without dropping requests
 - UDP + TCP DNS support with automatic truncation fallback
 - Structured per-query logging with action, latency, and source IP
+- Per-feed toggles: enable/disable URLhaus, OpenPhish, PhishTank independently
 - Optional PhishTank integration with API key
 
 ## Architecture
@@ -58,13 +60,13 @@ response  UDP first, retry TCP if truncated
 |---|---|
 | `bloom.rs` | Packed bit-vector bloom filter, double hashing, no crates |
 | `trie.rs` | Radix trie with label-reversed domain storage, wildcard via `is_blocked` |
-| `proxy.rs` | Async UDP + TCP listeners, two-stage block check, structured logging |
+| `proxy.rs` | Async UDP + TCP listeners, two-stage block check, hot-reload via `ArcSwap`, structured logging |
 | `feeds.rs` | `ThreatFeed` trait, URLhaus, OpenPhish, PhishTank implementations |
-| `config.rs` | TOML config: listen addr, upstream, blocklist path, feed API keys |
+| `config.rs` | TOML config: listen addr, upstream, blocklist path, feed toggles, refresh interval |
 
 ### Threat feeds
 
-Feeds are fetched at startup and merged into the bloom filter and trie:
+Feeds are fetched at startup and refreshed every `refresh_secs` (default: 3600s). Each feed can be toggled independently in the config.
 
 | Feed | Format | Auth | Domains (approx) |
 |---|---|---|---|
@@ -72,7 +74,19 @@ Feeds are fetched at startup and merged into the bloom filter and trie:
 | OpenPhish | Plain text URLs | None | ~200 |
 | PhishTank | JSON (`url` field) | API key | ~50,000 |
 
-Feed failures are logged and skipped — the proxy starts with whatever it has.
+Feed failures are logged and skipped — the proxy starts (and reloads) with whatever it has.
+
+### Hot-reload
+
+Blocklists are refreshed every `refresh_secs` without dropping in-flight queries:
+
+1. A background tokio task sleeps for `refresh_secs`
+2. Fetches all enabled feeds + static blocklist
+3. Builds a new bloom filter and trie from scratch
+4. Atomically swaps the old blocklist via `ArcSwap` — lock-free, wait-free reads
+5. In-flight queries keep using old data until they finish (reference-counted via `Arc`)
+
+If a reload fails (network error, feed down), the old blocklist stays active and a warning is logged.
 
 ### Bloom filter design
 
@@ -106,19 +120,21 @@ Measured with Criterion on 100,000 domains, release build.
 
 | Operation | Time |
 |---|---|
-| Bloom lookup — hit | 89 ns |
-| Bloom lookup — miss | 158 ns |
-| Trie lookup — exact hit | 396 ns |
-| Trie lookup — wildcard hit | 294 ns |
-| Trie lookup — miss | 190 ns |
-| Two-stage lookup — hit | 449 ns |
-| Two-stage lookup — miss | 294 ns |
+| Bloom lookup — hit | 99 ns |
+| Bloom lookup — miss | 163 ns |
+| Trie lookup — exact hit | 499 ns |
+| Trie lookup — wildcard hit | 448 ns |
+| Trie lookup — miss | 245 ns |
+| Two-stage lookup — hit | 811 ns |
+| Two-stage lookup — miss | 378 ns |
 
 **Why bloom miss is slower than hit:** on a hit, all `k` positions must return 1 — the loop checks every hash. On a miss, the real-world slowdown comes from cache pressure: missed domains scatter to cold bit positions the CPU hasn't recently accessed.
 
 **Why wildcard hit is faster than exact hit:** `is_blocked` is checked before descending to the next label. A blocked parent (`malware.com`) short-circuits immediately — the trie never walks to the leaf node.
 
-**Two-stage miss (294 ns):** bloom eliminates the miss in ~158 ns; the trie is never consulted. This is the common case for legitimate traffic.
+**Two-stage miss (378 ns):** bloom eliminates the miss in ~163 ns; the trie is never consulted. This is the common case for legitimate traffic.
+
+*Note: benchmarks run on WSL2 (Linux 5.15). Native Linux or bare-metal will show lower absolute times.*
 
 ## Configuration
 
@@ -136,7 +152,10 @@ timeout_ms = 5000
 path = "blocklist.txt"   # one domain per line, # comments ok
 
 [feeds]
-phishtank_api_key = "your-key"   # optional
+urlhaus = true           # abuse.ch URLhaus feed
+openphish = true         # OpenPhish community feed
+# phishtank_api_key = "your-key"   # optional, enables PhishTank
+refresh_secs = 3600      # hot-reload interval (0 = disabled)
 ```
 
 ## Usage

@@ -4,17 +4,14 @@ mod feeds;
 mod proxy;
 mod trie;
 
-use std::io::BufRead;
 use std::path::PathBuf;
 
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use bloom::BloomFilter;
 use config::Config;
-use proxy::DnsProxy;
-use trie::DomainTrie;
+use proxy::{load_blocklist, DnsProxy};
 
 #[derive(Parser)]
 #[command(name = "dnsink", about = "DNS threat gateway")]
@@ -50,68 +47,4 @@ async fn main() -> anyhow::Result<()> {
     let (bloom, trie) = load_blocklist(&config).await?;
     let proxy = DnsProxy::new(config, bloom, trie);
     proxy.run().await
-}
-
-async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>, DomainTrie)> {
-    let mut domains: Vec<String> = Vec::new();
-
-    // Static file
-    if let Some(bl_config) = &config.blocklist {
-        let file = std::fs::File::open(&bl_config.path)?;
-        let file_domains = std::io::BufReader::new(file).lines().filter_map(|line| {
-            let line = line.ok()?;
-            let trimmed = line.trim().to_lowercase();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                Some(trimmed.trim_end_matches('.').to_string())
-            }
-        });
-        domains.extend(file_domains);
-        info!(path = %bl_config.path, "loaded static blocklist");
-    }
-
-    // Live threat feeds (configurable)
-    if config.feeds.urlhaus {
-        load_feed(&feeds::UrlHausFeed, &mut domains).await;
-    }
-    if config.feeds.openphish {
-        load_feed(&feeds::OpenPhishFeed, &mut domains).await;
-    }
-    if let Some(key) = &config.feeds.phishtank_api_key {
-        load_feed(
-            &feeds::PhishTankFeed {
-                api_key: key.clone(),
-            },
-            &mut domains,
-        )
-        .await;
-    }
-
-    if domains.is_empty() {
-        return Ok((None, DomainTrie::new()));
-    }
-
-    let mut bloom = BloomFilter::new(domains.len(), 0.01);
-    let mut trie = DomainTrie::new();
-    for domain in &domains {
-        bloom.insert(domain);
-        trie.insert(domain);
-    }
-
-    info!(total = domains.len(), "blocklist ready");
-    Ok((Some(bloom), trie))
-}
-
-async fn load_feed(feed: &impl feeds::ThreatFeed, domains: &mut Vec<String>) {
-    match feed.fetch().await {
-        Ok(raw) => {
-            let parsed = feed.parse(&raw);
-            info!(feed = feed.name(), domains = parsed.len(), "fetched feed");
-            domains.extend(parsed);
-        }
-        Err(e) => {
-            tracing::warn!(feed = feed.name(), error = %e, "failed to fetch feed, skipping");
-        }
-    }
 }

@@ -1,7 +1,9 @@
+use std::io::BufRead;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,52 +12,64 @@ use tracing::{debug, error, info, warn};
 
 use crate::bloom::BloomFilter;
 use crate::config::Config;
+use crate::feeds;
 use crate::trie::DomainTrie;
 
 /// Maximum DNS message size with EDNS0 support
 const MAX_DNS_MSG_SIZE: usize = 4096;
 
-struct Shared {
-    config: Config,
-    bloom: Option<BloomFilter>,
-    trie: DomainTrie,
+/// Blocklist state that gets atomically swapped on reload.
+pub struct Blocklist {
+    pub bloom: Option<BloomFilter>,
+    pub trie: DomainTrie,
 }
 
 pub struct DnsProxy {
-    shared: Arc<Shared>,
+    config: Arc<Config>,
+    blocklist: Arc<ArcSwap<Blocklist>>,
 }
 
 impl DnsProxy {
     pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> Self {
         Self {
-            shared: Arc::new(Shared {
-                config,
-                bloom,
-                trie,
-            }),
+            config: Arc::new(config),
+            blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
         }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
         let listen_addr = format!(
             "{}:{}",
-            self.shared.config.listen.address, self.shared.config.listen.port
+            self.config.listen.address, self.config.listen.port
         );
 
         let udp_socket = UdpSocket::bind(&listen_addr).await?;
         let tcp_listener = TcpListener::bind(&listen_addr).await?;
         info!("listening on {listen_addr} (UDP + TCP)");
 
-        let shared = self.shared.clone();
+        // Spawn hot-reload task
+        let reload_config = self.config.clone();
+        let reload_blocklist = self.blocklist.clone();
+        let refresh_secs = self.config.feeds.refresh_secs;
+        if refresh_secs > 0 {
+            tokio::spawn(async move {
+                Self::reload_loop(reload_config, reload_blocklist, refresh_secs).await;
+            });
+            info!(interval_secs = refresh_secs, "hot-reload task started");
+        }
+
+        let config = self.config.clone();
+        let blocklist = self.blocklist.clone();
         let udp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(udp_socket, &shared).await {
+            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist).await {
                 error!(error = %e, "UDP listener failed");
             }
         });
 
-        let shared = self.shared.clone();
+        let config = self.config.clone();
+        let blocklist = self.blocklist.clone();
         let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_tcp(tcp_listener, shared).await {
+            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist).await {
                 error!(error = %e, "TCP listener failed");
             }
         });
@@ -69,7 +83,35 @@ impl DnsProxy {
         Ok(())
     }
 
-    async fn run_udp(socket: UdpSocket, shared: &Shared) -> anyhow::Result<()> {
+    async fn reload_loop(
+        config: Arc<Config>,
+        blocklist: Arc<ArcSwap<Blocklist>>,
+        refresh_secs: u64,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+        interval.tick().await; // skip the immediate first tick
+
+        loop {
+            interval.tick().await;
+            info!("reloading blocklists");
+
+            match load_blocklist(&config).await {
+                Ok((bloom, trie)) => {
+                    blocklist.store(Arc::new(Blocklist { bloom, trie }));
+                    info!("blocklist reload complete");
+                }
+                Err(e) => {
+                    warn!(error = %e, "blocklist reload failed, keeping old data");
+                }
+            }
+        }
+    }
+
+    async fn run_udp(
+        socket: UdpSocket,
+        config: &Config,
+        blocklist: &ArcSwap<Blocklist>,
+    ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
 
         loop {
@@ -77,11 +119,13 @@ impl DnsProxy {
             let query_data = buf[..len].to_vec();
             let start = Instant::now();
 
-            let upstream_addr = shared.config.upstream_addr()?;
-            let timeout = Duration::from_millis(shared.config.upstream.timeout_ms);
+            let upstream_addr = config.upstream_addr()?;
+            let timeout = Duration::from_millis(config.upstream.timeout_ms);
 
+            // Load a snapshot of the current blocklist — lock-free
+            let bl = blocklist.load();
             let (domain, nxdomain) =
-                Self::check_blocklist(&query_data, &shared.bloom, &shared.trie);
+                Self::check_blocklist(&query_data, &bl.bloom, &bl.trie);
 
             if let Some(nxdomain_bytes) = nxdomain {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
@@ -107,22 +151,28 @@ impl DnsProxy {
         }
     }
 
-    async fn run_tcp(listener: TcpListener, shared: Arc<Shared>) -> anyhow::Result<()> {
+    async fn run_tcp(
+        listener: TcpListener,
+        config: Arc<Config>,
+        blocklist: Arc<ArcSwap<Blocklist>>,
+    ) -> anyhow::Result<()> {
         loop {
             let (stream, src) = listener.accept().await?;
-            let upstream_addr = shared.config.upstream_addr()?;
-            let timeout = Duration::from_millis(shared.config.upstream.timeout_ms);
-            let shared = shared.clone();
+            let upstream_addr = config.upstream_addr()?;
+            let timeout = Duration::from_millis(config.upstream.timeout_ms);
+            let blocklist = blocklist.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
+                // Load blocklist snapshot for this connection
+                let bl = blocklist.load();
                 if let Err(e) = Self::handle_tcp_client(
                     stream,
                     src,
                     upstream_addr,
                     timeout,
-                    &shared.bloom,
-                    &shared.trie,
+                    &bl.bloom,
+                    &bl.trie,
                 )
                 .await
                 {
@@ -280,5 +330,71 @@ impl DnsProxy {
             proto = %proto,
             "query"
         );
+    }
+}
+
+/// Load blocklist from static file + live threat feeds.
+/// Shared between initial startup and hot-reload.
+pub async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilter>, DomainTrie)> {
+    let mut domains: Vec<String> = Vec::new();
+
+    // Static file
+    if let Some(bl_config) = &config.blocklist {
+        let file = std::fs::File::open(&bl_config.path)?;
+        let file_domains = std::io::BufReader::new(file).lines().filter_map(|line| {
+            let line = line.ok()?;
+            let trimmed = line.trim().to_lowercase();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(trimmed.trim_end_matches('.').to_string())
+            }
+        });
+        domains.extend(file_domains);
+        info!(path = %bl_config.path, "loaded static blocklist");
+    }
+
+    // Live threat feeds (configurable)
+    if config.feeds.urlhaus {
+        load_feed(&feeds::UrlHausFeed, &mut domains).await;
+    }
+    if config.feeds.openphish {
+        load_feed(&feeds::OpenPhishFeed, &mut domains).await;
+    }
+    if let Some(key) = &config.feeds.phishtank_api_key {
+        load_feed(
+            &feeds::PhishTankFeed {
+                api_key: key.clone(),
+            },
+            &mut domains,
+        )
+        .await;
+    }
+
+    if domains.is_empty() {
+        return Ok((None, DomainTrie::new()));
+    }
+
+    let mut bloom = BloomFilter::new(domains.len(), 0.01);
+    let mut trie = DomainTrie::new();
+    for domain in &domains {
+        bloom.insert(domain);
+        trie.insert(domain);
+    }
+
+    info!(total = domains.len(), "blocklist ready");
+    Ok((Some(bloom), trie))
+}
+
+async fn load_feed(feed: &impl feeds::ThreatFeed, domains: &mut Vec<String>) {
+    match feed.fetch().await {
+        Ok(raw) => {
+            let parsed = feed.parse(&raw);
+            info!(feed = feed.name(), domains = parsed.len(), "fetched feed");
+            domains.extend(parsed);
+        }
+        Err(e) => {
+            warn!(feed = feed.name(), error = %e, "failed to fetch feed, skipping");
+        }
     }
 }
