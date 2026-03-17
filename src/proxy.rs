@@ -38,10 +38,7 @@ impl DnsProxy {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        let listen_addr = format!(
-            "{}:{}",
-            self.config.listen.address, self.config.listen.port
-        );
+        let listen_addr = format!("{}:{}", self.config.listen.address, self.config.listen.port);
 
         let udp_socket = UdpSocket::bind(&listen_addr).await?;
         let tcp_listener = TcpListener::bind(&listen_addr).await?;
@@ -124,8 +121,7 @@ impl DnsProxy {
 
             // Load a snapshot of the current blocklist — lock-free
             let bl = blocklist.load();
-            let (domain, nxdomain) =
-                Self::check_blocklist(&query_data, &bl.bloom, &bl.trie);
+            let (domain, nxdomain) = Self::check_blocklist(&query_data, &bl.bloom, &bl.trie);
 
             if let Some(nxdomain_bytes) = nxdomain {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
