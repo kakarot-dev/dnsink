@@ -44,12 +44,25 @@ pub struct ListenConfig {
     pub port: u16,
 }
 
+#[derive(Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamProtocol {
+    #[default]
+    Udp,
+    Doh,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpstreamConfig {
     pub address: String,
     pub port: u16,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub protocol: UpstreamProtocol,
+    pub doh_url: Option<String>,
 }
+
+const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -60,6 +73,13 @@ impl Config {
 
     pub fn upstream_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(format!("{}:{}", self.upstream.address, self.upstream.port).parse()?)
+    }
+
+    pub fn doh_url(&self) -> &str {
+        self.upstream
+            .doh_url
+            .as_deref()
+            .unwrap_or(DEFAULT_DOH_URL)
     }
 }
 
@@ -74,6 +94,8 @@ impl Default for Config {
                 address: "8.8.8.8".to_string(),
                 port: 53,
                 timeout_ms: 5000,
+                protocol: UpstreamProtocol::default(),
+                doh_url: None,
             },
             blocklist: None,
             feeds: FeedsConfig {

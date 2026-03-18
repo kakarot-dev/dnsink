@@ -6,6 +6,8 @@ port = 5353
 address = "8.8.8.8"
 port = 53
 timeout_ms = 5000
+# protocol = "doh"           # "udp" (default) or "doh"
+# doh_url = "https://1.1.1.1/dns-query"  # default if omitted
 
 # Optional: local blocklist file (one domain per line)
 # [blocklist]

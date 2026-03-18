@@ -8,6 +8,7 @@ A high-performance DNS proxy that blocks malware, C2, and phishing domains at th
 - Wildcard blocking: block `malware.com` and all subdomains automatically
 - Two-stage lookup: bloom filter pre-screens, radix trie confirms
 - Hot-reload: blocklists refresh on a configurable interval without dropping requests
+- DNS-over-HTTPS (DoH) upstream: encrypt queries to Cloudflare, Google, or any RFC 8484 endpoint
 - UDP + TCP DNS support with automatic truncation fallback
 - Structured per-query logging with action, latency, and source IP
 - Per-feed toggles: enable/disable URLhaus, OpenPhish, PhishTank independently
@@ -44,8 +45,9 @@ Client query (UDP/TCP)
 blocked    allowed
    │         │
    ▼         ▼
-NXDOMAIN  forward to upstream (8.8.8.8)
-response  UDP first, retry TCP if truncated
+NXDOMAIN  forward to upstream
+response  UDP → retry TCP if truncated
+          or DoH (RFC 8484) if configured
    │         │
    └────┬────┘
         │
@@ -60,9 +62,9 @@ response  UDP first, retry TCP if truncated
 |---|---|
 | `bloom.rs` | Packed bit-vector bloom filter, double hashing, no crates |
 | `trie.rs` | Radix trie with label-reversed domain storage, wildcard via `is_blocked` |
-| `proxy.rs` | Async UDP + TCP listeners, two-stage block check, hot-reload via `ArcSwap`, structured logging |
+| `proxy.rs` | Async UDP + TCP listeners, DoH upstream, two-stage block check, hot-reload via `ArcSwap`, structured logging |
 | `feeds.rs` | `ThreatFeed` trait, URLhaus, OpenPhish, PhishTank implementations |
-| `config.rs` | TOML config: listen addr, upstream, blocklist path, feed toggles, refresh interval |
+| `config.rs` | TOML config: listen addr, upstream (UDP or DoH), blocklist path, feed toggles, refresh interval |
 
 ### Threat feeds
 
@@ -147,6 +149,8 @@ port = 5353
 address = "8.8.8.8"
 port = 53
 timeout_ms = 5000
+# protocol = "doh"                        # "udp" (default) or "doh"
+# doh_url = "https://1.1.1.1/dns-query"   # Cloudflare default if omitted
 
 [blocklist]
 path = "blocklist.txt"   # one domain per line, # comments ok

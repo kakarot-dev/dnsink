@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 use crate::bloom::BloomFilter;
-use crate::config::Config;
+use crate::config::{Config, UpstreamProtocol};
 use crate::feeds;
 use crate::trie::DomainTrie;
 
@@ -27,13 +27,19 @@ pub struct Blocklist {
 pub struct DnsProxy {
     config: Arc<Config>,
     blocklist: Arc<ArcSwap<Blocklist>>,
+    http: reqwest::Client,
 }
 
 impl DnsProxy {
     pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.upstream.timeout_ms))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
+            http,
         }
     }
 
@@ -57,16 +63,18 @@ impl DnsProxy {
 
         let config = self.config.clone();
         let blocklist = self.blocklist.clone();
+        let http = self.http.clone();
         let udp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist).await {
+            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist, &http).await {
                 error!(error = %e, "UDP listener failed");
             }
         });
 
         let config = self.config.clone();
         let blocklist = self.blocklist.clone();
+        let http = self.http.clone();
         let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist).await {
+            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist, http).await {
                 error!(error = %e, "TCP listener failed");
             }
         });
@@ -108,15 +116,16 @@ impl DnsProxy {
         socket: UdpSocket,
         config: &Config,
         blocklist: &ArcSwap<Blocklist>,
+        http: &reqwest::Client,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
+        let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
 
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
             let query_data = buf[..len].to_vec();
             let start = Instant::now();
 
-            let upstream_addr = config.upstream_addr()?;
             let timeout = Duration::from_millis(config.upstream.timeout_ms);
 
             // Load a snapshot of the current blocklist — lock-free
@@ -129,16 +138,22 @@ impl DnsProxy {
                 continue;
             }
 
-            let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
-            let response =
-                Self::forward_udp(&fwd_socket, &query_data, upstream_addr, timeout).await;
+            let response = if use_doh {
+                Self::forward_doh(http, config.doh_url(), &query_data).await
+            } else {
+                let upstream_addr = config.upstream_addr()?;
+                let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
+                Self::forward_udp(&fwd_socket, &query_data, upstream_addr, timeout).await
+            };
+
+            let proto = if use_doh { "doh" } else { "udp" };
 
             match response {
                 Ok(response_data) => {
                     if let Err(e) = socket.send_to(&response_data, src).await {
                         error!(src = %src, error = %e, "failed to send response");
                     }
-                    Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), "udp");
+                    Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), proto);
                 }
                 Err(e) => {
                     warn!(src = %src, error = %e, "upstream query failed");
@@ -151,24 +166,29 @@ impl DnsProxy {
         listener: TcpListener,
         config: Arc<Config>,
         blocklist: Arc<ArcSwap<Blocklist>>,
+        http: reqwest::Client,
     ) -> anyhow::Result<()> {
+        let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
+        let doh_url = config.doh_url().to_string();
         loop {
             let (stream, src) = listener.accept().await?;
-            let upstream_addr = config.upstream_addr()?;
             let timeout = Duration::from_millis(config.upstream.timeout_ms);
+            let upstream_addr = if use_doh {
+                None
+            } else {
+                Some(config.upstream_addr()?)
+            };
             let blocklist = blocklist.clone();
+            let http = http.clone();
+            let doh_url = doh_url.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
                 // Load blocklist snapshot for this connection
                 let bl = blocklist.load();
                 if let Err(e) = Self::handle_tcp_client(
-                    stream,
-                    src,
-                    upstream_addr,
-                    timeout,
-                    &bl.bloom,
-                    &bl.trie,
+                    stream, src, upstream_addr, timeout, &bl.bloom, &bl.trie,
+                    use_doh, &http, &doh_url,
                 )
                 .await
                 {
@@ -186,10 +206,13 @@ impl DnsProxy {
     async fn handle_tcp_client(
         mut stream: TcpStream,
         src: SocketAddr,
-        upstream: SocketAddr,
+        upstream: Option<SocketAddr>,
         timeout: Duration,
         bloom: &Option<BloomFilter>,
         trie: &DomainTrie,
+        use_doh: bool,
+        http: &reqwest::Client,
+        doh_url: &str,
     ) -> anyhow::Result<()> {
         // Read 2-byte length prefix
         let msg_len = stream.read_u16().await? as usize;
@@ -212,24 +235,30 @@ impl DnsProxy {
             return Ok(());
         }
 
-        // Forward upstream over UDP first, fall back to TCP if truncated
-        let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let mut response_data =
-            Self::forward_udp(&fwd_socket, &query_data, upstream, timeout).await?;
+        let (response_data, proto) = if use_doh {
+            // DoH handles large responses natively — no truncation retry needed
+            (Self::forward_doh(http, doh_url, &query_data).await?, "doh")
+        } else {
+            let upstream = upstream.expect("upstream addr required for UDP/TCP");
+            let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let mut data =
+                Self::forward_udp(&fwd_socket, &query_data, upstream, timeout).await?;
 
-        // Check if upstream response has TC (truncated) bit — retry over TCP
-        if let Ok(msg) = Message::from_bytes(&response_data) {
-            if msg.truncated() {
-                debug!(src = %src, "upstream response truncated, retrying over TCP");
-                response_data = Self::forward_tcp(&query_data, upstream, timeout).await?;
+            // Check if upstream response has TC (truncated) bit — retry over TCP
+            if let Ok(msg) = Message::from_bytes(&data) {
+                if msg.truncated() {
+                    debug!(src = %src, "upstream response truncated, retrying over TCP");
+                    data = Self::forward_tcp(&query_data, upstream, timeout).await?;
+                }
             }
-        }
+            (data, "tcp")
+        };
 
         // Write response with 2-byte length prefix
         let len_bytes = (response_data.len() as u16).to_be_bytes();
         stream.write_all(&len_bytes).await?;
         stream.write_all(&response_data).await?;
-        Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), "tcp");
+        Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), proto);
 
         Ok(())
     }
@@ -267,6 +296,25 @@ impl DnsProxy {
         tokio::time::timeout(timeout, stream.read_exact(&mut response)).await??;
 
         Ok(response)
+    }
+
+    /// Forward a DNS query via DNS-over-HTTPS (RFC 8484).
+    async fn forward_doh(
+        http: &reqwest::Client,
+        doh_url: &str,
+        query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let resp = http
+            .post(doh_url)
+            .header("content-type", "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(query.to_vec())
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(resp.to_vec())
     }
 
     /// Returns the queried domain and, if blocked, the NXDOMAIN response bytes.
