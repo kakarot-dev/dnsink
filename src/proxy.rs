@@ -31,16 +31,15 @@ pub struct DnsProxy {
 }
 
 impl DnsProxy {
-    pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> Self {
+    pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.upstream.timeout_ms))
-            .build()
-            .expect("failed to build HTTP client");
-        Self {
+            .build()?;
+        Ok(Self {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
             http,
-        }
+        })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -120,6 +119,8 @@ impl DnsProxy {
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
+        // Bind a single forwarding socket upfront, reused across all queries
+        let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
@@ -142,7 +143,6 @@ impl DnsProxy {
                 Self::forward_doh(http, config.doh_url(), &query_data).await
             } else {
                 let upstream_addr = config.upstream_addr()?;
-                let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
                 Self::forward_udp(&fwd_socket, &query_data, upstream_addr, timeout).await
             };
 
@@ -170,6 +170,8 @@ impl DnsProxy {
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
+        // Shared forwarding socket for UDP-first upstream, reused across connections
+        let fwd_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         loop {
             let (stream, src) = listener.accept().await?;
             let timeout = Duration::from_millis(config.upstream.timeout_ms);
@@ -181,6 +183,7 @@ impl DnsProxy {
             let blocklist = blocklist.clone();
             let http = http.clone();
             let doh_url = doh_url.clone();
+            let fwd_socket = fwd_socket.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
@@ -188,7 +191,7 @@ impl DnsProxy {
                 let bl = blocklist.load();
                 if let Err(e) = Self::handle_tcp_client(
                     stream, src, upstream_addr, timeout, &bl.bloom, &bl.trie,
-                    use_doh, &http, &doh_url,
+                    use_doh, &http, &doh_url, &fwd_socket,
                 )
                 .await
                 {
@@ -213,6 +216,7 @@ impl DnsProxy {
         use_doh: bool,
         http: &reqwest::Client,
         doh_url: &str,
+        fwd_socket: &UdpSocket,
     ) -> anyhow::Result<()> {
         // Read 2-byte length prefix
         let msg_len = stream.read_u16().await? as usize;
@@ -239,10 +243,10 @@ impl DnsProxy {
             // DoH handles large responses natively — no truncation retry needed
             (Self::forward_doh(http, doh_url, &query_data).await?, "doh")
         } else {
-            let upstream = upstream.expect("upstream addr required for UDP/TCP");
-            let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let upstream = upstream
+                .ok_or_else(|| anyhow::anyhow!("upstream addr required for UDP/TCP forwarding"))?;
             let mut data =
-                Self::forward_udp(&fwd_socket, &query_data, upstream, timeout).await?;
+                Self::forward_udp(fwd_socket, &query_data, upstream, timeout).await?;
 
             // Check if upstream response has TC (truncated) bit — retry over TCP
             if let Ok(msg) = Message::from_bytes(&data) {
@@ -323,10 +327,15 @@ impl DnsProxy {
         bloom: &Option<BloomFilter>,
         trie: &DomainTrie,
     ) -> (String, Option<Vec<u8>>) {
-        let Some(message) = Message::from_bytes(query_data).ok() else {
-            return (String::new(), None);
+        let message = match Message::from_bytes(query_data) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "failed to parse DNS query");
+                return (String::new(), None);
+            }
         };
         let Some(query) = message.queries().first() else {
+            warn!("DNS query has no question section");
             return (String::new(), None);
         };
         let domain = query
@@ -353,8 +362,13 @@ impl DnsProxy {
             response.take_answers();
             response.take_additionals();
             response.take_name_servers();
-            let bytes = response.to_bytes().ok();
-            (domain, bytes)
+            match response.to_bytes() {
+                Ok(bytes) => (domain, Some(bytes)),
+                Err(e) => {
+                    warn!(domain = %domain, error = %e, "failed to serialize NXDOMAIN response");
+                    (domain, None)
+                }
+            }
         } else {
             (domain, None)
         }
@@ -440,5 +454,136 @@ async fn load_feed(feed: &impl feeds::ThreatFeed, domains: &mut Vec<String>) {
         Err(e) => {
             warn!(feed = feed.name(), error = %e, "failed to fetch feed, skipping");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Header, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::serialize::binary::BinEncodable;
+
+    /// Build a minimal DNS query for the given domain.
+    fn make_query(domain: &str) -> Vec<u8> {
+        let mut msg = Message::new();
+        let mut header = Header::new();
+        header.set_id(1234);
+        header.set_op_code(OpCode::Query);
+        header.set_recursion_desired(true);
+        msg.set_header(header);
+        msg.add_query(Query::query(Name::from_ascii(domain).unwrap(), RecordType::A));
+        msg.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn check_blocklist_blocks_exact_domain() {
+        let mut bloom = BloomFilter::new(10, 0.01);
+        bloom.insert(&"evil.com".to_string());
+        let mut trie = DomainTrie::new();
+        trie.insert("evil.com");
+
+        let query = make_query("evil.com");
+        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+
+        assert_eq!(domain, "evil.com");
+        assert!(nxdomain.is_some());
+
+        // Verify the response is NXDOMAIN
+        let resp = Message::from_bytes(&nxdomain.unwrap()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+        assert_eq!(resp.message_type(), MessageType::Response);
+        assert!(resp.answers().is_empty());
+    }
+
+    #[test]
+    fn check_blocklist_allows_clean_domain() {
+        let mut bloom = BloomFilter::new(10, 0.01);
+        bloom.insert(&"evil.com".to_string());
+        let mut trie = DomainTrie::new();
+        trie.insert("evil.com");
+
+        let query = make_query("google.com");
+        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+
+        assert_eq!(domain, "google.com");
+        assert!(nxdomain.is_none());
+    }
+
+    #[test]
+    fn check_blocklist_blocks_subdomain_via_wildcard() {
+        let mut bloom = BloomFilter::new(10, 0.01);
+        bloom.insert(&"malware.com".to_string());
+        let mut trie = DomainTrie::new();
+        trie.insert("malware.com");
+
+        let query = make_query("sub.malware.com");
+        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+
+        assert_eq!(domain, "sub.malware.com");
+        assert!(nxdomain.is_some());
+    }
+
+    #[test]
+    fn check_blocklist_handles_no_bloom() {
+        let mut trie = DomainTrie::new();
+        trie.insert("evil.com");
+
+        let query = make_query("evil.com");
+        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &None, &trie);
+        assert!(nxdomain.is_some(), "should block even without bloom filter");
+    }
+
+    #[test]
+    fn check_blocklist_handles_invalid_dns() {
+        let trie = DomainTrie::new();
+        let garbage = vec![0xFF, 0x00, 0x01];
+        let (domain, nxdomain) = DnsProxy::check_blocklist(&garbage, &None, &trie);
+        assert!(domain.is_empty());
+        assert!(nxdomain.is_none());
+    }
+
+    #[test]
+    fn nxdomain_response_preserves_query_id() {
+        let mut bloom = BloomFilter::new(10, 0.01);
+        bloom.insert(&"evil.com".to_string());
+        let mut trie = DomainTrie::new();
+        trie.insert("evil.com");
+
+        let query_bytes = make_query("evil.com");
+        let original = Message::from_bytes(&query_bytes).unwrap();
+        let (_, nxdomain) = DnsProxy::check_blocklist(&query_bytes, &Some(bloom), &trie);
+
+        let resp = Message::from_bytes(&nxdomain.unwrap()).unwrap();
+        assert_eq!(resp.id(), original.id(), "response ID must match query ID");
+    }
+
+    #[tokio::test]
+    async fn hot_reload_swaps_blocklist() {
+        let blocklist = Arc::new(ArcSwap::from_pointee(Blocklist {
+            bloom: None,
+            trie: DomainTrie::new(),
+        }));
+
+        // Initially empty — nothing blocked
+        let query = make_query("evil.com");
+        let bl = blocklist.load();
+        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
+        assert!(nxdomain.is_none(), "should not be blocked before reload");
+
+        // Simulate a reload: build new blocklist with evil.com
+        let mut new_bloom = BloomFilter::new(10, 0.01);
+        new_bloom.insert(&"evil.com".to_string());
+        let mut new_trie = DomainTrie::new();
+        new_trie.insert("evil.com");
+        blocklist.store(Arc::new(Blocklist {
+            bloom: Some(new_bloom),
+            trie: new_trie,
+        }));
+
+        // After reload — evil.com is blocked
+        let bl = blocklist.load();
+        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
+        assert!(nxdomain.is_some(), "should be blocked after reload");
     }
 }

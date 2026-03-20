@@ -45,6 +45,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (bloom, trie) = load_blocklist(&config).await?;
-    let proxy = DnsProxy::new(config, bloom, trie);
+    let proxy = DnsProxy::new(config, bloom, trie)?;
     proxy.run().await
 }
