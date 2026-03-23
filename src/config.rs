@@ -11,6 +11,23 @@ pub struct Config {
     pub blocklist: Option<BlocklistConfig>,
     #[serde(default)]
     pub feeds: FeedsConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub format: LogFormat,
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -101,6 +118,7 @@ impl Default for Config {
                 phishtank_api_key: None,
                 refresh_secs: 3600,
             },
+            logging: LoggingConfig::default(),
         }
     }
 }

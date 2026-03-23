@@ -4,13 +4,14 @@ mod feeds;
 mod proxy;
 mod trie;
 
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use config::Config;
+use config::{Config, LogFormat};
 use proxy::{load_blocklist, DnsProxy};
 
 #[derive(Parser)]
@@ -23,19 +24,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("dnsink=debug".parse()?))
-        .init();
-
     let cli = Cli::parse();
 
     let config = if cli.config.exists() {
-        info!(path = %cli.config.display(), "loading config");
         Config::load(&cli.config)?
     } else {
-        info!("no config file found, using defaults");
         Config::default()
     };
+
+    init_tracing(&config)?;
 
     info!(
         listen = %format!("{}:{}", config.listen.address, config.listen.port),
@@ -47,4 +44,37 @@ async fn main() -> anyhow::Result<()> {
     let (bloom, trie) = load_blocklist(&config).await?;
     let proxy = DnsProxy::new(config, bloom, trie)?;
     proxy.run().await
+}
+
+fn init_tracing(config: &Config) -> anyhow::Result<()> {
+    let filter = EnvFilter::from_default_env().add_directive("dnsink=debug".parse()?);
+
+    match (&config.logging.format, &config.logging.file) {
+        (LogFormat::Json, Some(path)) => {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_writer(file)
+                .init();
+        }
+        (LogFormat::Json, None) => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        (LogFormat::Text, Some(path)) => {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(file)
+                .init();
+        }
+        (LogFormat::Text, None) => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
+
+    Ok(())
 }
