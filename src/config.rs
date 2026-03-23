@@ -76,10 +76,7 @@ impl Config {
     }
 
     pub fn doh_url(&self) -> &str {
-        self.upstream
-            .doh_url
-            .as_deref()
-            .unwrap_or(DEFAULT_DOH_URL)
+        self.upstream.doh_url.as_deref().unwrap_or(DEFAULT_DOH_URL)
     }
 }
 

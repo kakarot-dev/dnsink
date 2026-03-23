@@ -24,6 +24,18 @@ pub struct Blocklist {
     pub trie: DomainTrie,
 }
 
+/// Shared context for handling a single TCP DNS client connection.
+/// Groups parameters that are common across all connections to satisfy clippy::too_many_arguments.
+struct TcpClientCtx<'a> {
+    upstream: Option<SocketAddr>,
+    timeout: Duration,
+    blocklist: &'a Blocklist,
+    use_doh: bool,
+    http: &'a reqwest::Client,
+    doh_url: &'a str,
+    fwd_socket: &'a UdpSocket,
+}
+
 pub struct DnsProxy {
     config: Arc<Config>,
     blocklist: Arc<ArcSwap<Blocklist>>,
@@ -31,7 +43,11 @@ pub struct DnsProxy {
 }
 
 impl DnsProxy {
-    pub fn new(config: Config, bloom: Option<BloomFilter>, trie: DomainTrie) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Config,
+        bloom: Option<BloomFilter>,
+        trie: DomainTrie,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.upstream.timeout_ms))
             .build()?;
@@ -189,12 +205,16 @@ impl DnsProxy {
             tokio::spawn(async move {
                 // Load blocklist snapshot for this connection
                 let bl = blocklist.load();
-                if let Err(e) = Self::handle_tcp_client(
-                    stream, src, upstream_addr, timeout, &bl.bloom, &bl.trie,
-                    use_doh, &http, &doh_url, &fwd_socket,
-                )
-                .await
-                {
+                let ctx = TcpClientCtx {
+                    upstream: upstream_addr,
+                    timeout,
+                    blocklist: &bl,
+                    use_doh,
+                    http: &http,
+                    doh_url: &doh_url,
+                    fwd_socket: &fwd_socket,
+                };
+                if let Err(e) = Self::handle_tcp_client(stream, src, &ctx).await {
                     warn!(src = %src, error = %e, "TCP client failed");
                 }
             });
@@ -209,14 +229,7 @@ impl DnsProxy {
     async fn handle_tcp_client(
         mut stream: TcpStream,
         src: SocketAddr,
-        upstream: Option<SocketAddr>,
-        timeout: Duration,
-        bloom: &Option<BloomFilter>,
-        trie: &DomainTrie,
-        use_doh: bool,
-        http: &reqwest::Client,
-        doh_url: &str,
-        fwd_socket: &UdpSocket,
+        ctx: &TcpClientCtx<'_>,
     ) -> anyhow::Result<()> {
         // Read 2-byte length prefix
         let msg_len = stream.read_u16().await? as usize;
@@ -229,7 +242,8 @@ impl DnsProxy {
         stream.read_exact(&mut query_data).await?;
         let start = Instant::now();
 
-        let (domain, nxdomain) = Self::check_blocklist(&query_data, bloom, trie);
+        let (domain, nxdomain) =
+            Self::check_blocklist(&query_data, &ctx.blocklist.bloom, &ctx.blocklist.trie);
 
         if let Some(nxdomain_bytes) = nxdomain {
             let len_bytes = (nxdomain_bytes.len() as u16).to_be_bytes();
@@ -239,20 +253,24 @@ impl DnsProxy {
             return Ok(());
         }
 
-        let (response_data, proto) = if use_doh {
+        let (response_data, proto) = if ctx.use_doh {
             // DoH handles large responses natively — no truncation retry needed
-            (Self::forward_doh(http, doh_url, &query_data).await?, "doh")
+            (
+                Self::forward_doh(ctx.http, ctx.doh_url, &query_data).await?,
+                "doh",
+            )
         } else {
-            let upstream = upstream
+            let upstream = ctx
+                .upstream
                 .ok_or_else(|| anyhow::anyhow!("upstream addr required for UDP/TCP forwarding"))?;
             let mut data =
-                Self::forward_udp(fwd_socket, &query_data, upstream, timeout).await?;
+                Self::forward_udp(ctx.fwd_socket, &query_data, upstream, ctx.timeout).await?;
 
             // Check if upstream response has TC (truncated) bit — retry over TCP
             if let Ok(msg) = Message::from_bytes(&data) {
                 if msg.truncated() {
                     debug!(src = %src, "upstream response truncated, retrying over TCP");
-                    data = Self::forward_tcp(&query_data, upstream, timeout).await?;
+                    data = Self::forward_tcp(&query_data, upstream, ctx.timeout).await?;
                 }
             }
             (data, "tcp")
@@ -472,7 +490,10 @@ mod tests {
         header.set_op_code(OpCode::Query);
         header.set_recursion_desired(true);
         msg.set_header(header);
-        msg.add_query(Query::query(Name::from_ascii(domain).unwrap(), RecordType::A));
+        msg.add_query(Query::query(
+            Name::from_ascii(domain).unwrap(),
+            RecordType::A,
+        ));
         msg.to_bytes().unwrap()
     }
 
