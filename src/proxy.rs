@@ -1,5 +1,6 @@
 use std::io::BufRead;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,78 @@ use crate::trie::DomainTrie;
 /// Maximum DNS message size with EDNS0 support
 const MAX_DNS_MSG_SIZE: usize = 4096;
 
+/// Atomic query counters for the TUI / metrics endpoint.
+#[allow(dead_code)]
+pub struct QueryMetrics {
+    pub total: AtomicU64,
+    pub blocked: AtomicU64,
+    pub allowed: AtomicU64,
+    pub total_latency_ms: AtomicU64,
+}
+
+impl QueryMetrics {
+    pub fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            allowed: AtomicU64::new(0),
+            total_latency_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, action: &str, latency_ms: u64) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
+        match action {
+            "blocked" => {
+                self.blocked.fetch_add(1, Ordering::Relaxed);
+            }
+            "allowed" => {
+                self.allowed.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
+            allowed: self.allowed.load(Ordering::Relaxed),
+            total_latency_ms: self.total_latency_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct MetricsSnapshot {
+    pub total: u64,
+    pub blocked: u64,
+    pub allowed: u64,
+    pub total_latency_ms: u64,
+}
+
+impl MetricsSnapshot {
+    #[allow(dead_code)]
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.total_latency_ms as f64 / self.total as f64
+        }
+    }
+}
+
+/// Result of parsing + blocklist check on a single query.
+struct QueryResult {
+    domain: String,
+    qtype: String,
+    nxdomain: Option<Vec<u8>>,
+}
+
 /// Blocklist state that gets atomically swapped on reload.
 pub struct Blocklist {
     pub bloom: Option<BloomFilter>,
@@ -34,12 +107,14 @@ struct TcpClientCtx<'a> {
     http: &'a reqwest::Client,
     doh_url: &'a str,
     fwd_socket: &'a UdpSocket,
+    metrics: &'a QueryMetrics,
 }
 
 pub struct DnsProxy {
     config: Arc<Config>,
     blocklist: Arc<ArcSwap<Blocklist>>,
     http: reqwest::Client,
+    metrics: Arc<QueryMetrics>,
 }
 
 impl DnsProxy {
@@ -55,7 +130,13 @@ impl DnsProxy {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
             http,
+            metrics: Arc::new(QueryMetrics::new()),
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn metrics(&self) -> Arc<QueryMetrics> {
+        self.metrics.clone()
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -79,8 +160,9 @@ impl DnsProxy {
         let config = self.config.clone();
         let blocklist = self.blocklist.clone();
         let http = self.http.clone();
+        let metrics = self.metrics.clone();
         let udp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist, &http).await {
+            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist, &http, &metrics).await {
                 error!(error = %e, "UDP listener failed");
             }
         });
@@ -88,8 +170,9 @@ impl DnsProxy {
         let config = self.config.clone();
         let blocklist = self.blocklist.clone();
         let http = self.http.clone();
+        let metrics = self.metrics.clone();
         let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist, http).await {
+            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist, http, metrics).await {
                 error!(error = %e, "TCP listener failed");
             }
         });
@@ -132,6 +215,7 @@ impl DnsProxy {
         config: &Config,
         blocklist: &ArcSwap<Blocklist>,
         http: &reqwest::Client,
+        metrics: &QueryMetrics,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
@@ -147,11 +231,13 @@ impl DnsProxy {
 
             // Load a snapshot of the current blocklist — lock-free
             let bl = blocklist.load();
-            let (domain, nxdomain) = Self::check_blocklist(&query_data, &bl.bloom, &bl.trie);
+            let qr = Self::check_blocklist(&query_data, &bl.bloom, &bl.trie);
 
-            if let Some(nxdomain_bytes) = nxdomain {
+            if let Some(nxdomain_bytes) = qr.nxdomain {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
-                Self::log_outcome(src, &domain, "blocked", start.elapsed().as_millis(), "udp");
+                let latency = start.elapsed().as_millis();
+                metrics.record("blocked", latency as u64);
+                Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "udp");
                 continue;
             }
 
@@ -169,7 +255,9 @@ impl DnsProxy {
                     if let Err(e) = socket.send_to(&response_data, src).await {
                         error!(src = %src, error = %e, "failed to send response");
                     }
-                    Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), proto);
+                    let latency = start.elapsed().as_millis();
+                    metrics.record("allowed", latency as u64);
+                    Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
                 }
                 Err(e) => {
                     warn!(src = %src, error = %e, "upstream query failed");
@@ -183,6 +271,7 @@ impl DnsProxy {
         config: Arc<Config>,
         blocklist: Arc<ArcSwap<Blocklist>>,
         http: reqwest::Client,
+        metrics: Arc<QueryMetrics>,
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
@@ -200,6 +289,7 @@ impl DnsProxy {
             let http = http.clone();
             let doh_url = doh_url.clone();
             let fwd_socket = fwd_socket.clone();
+            let metrics = metrics.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
@@ -213,6 +303,7 @@ impl DnsProxy {
                     http: &http,
                     doh_url: &doh_url,
                     fwd_socket: &fwd_socket,
+                    metrics: &metrics,
                 };
                 if let Err(e) = Self::handle_tcp_client(stream, src, &ctx).await {
                     warn!(src = %src, error = %e, "TCP client failed");
@@ -242,14 +333,15 @@ impl DnsProxy {
         stream.read_exact(&mut query_data).await?;
         let start = Instant::now();
 
-        let (domain, nxdomain) =
-            Self::check_blocklist(&query_data, &ctx.blocklist.bloom, &ctx.blocklist.trie);
+        let qr = Self::check_blocklist(&query_data, &ctx.blocklist.bloom, &ctx.blocklist.trie);
 
-        if let Some(nxdomain_bytes) = nxdomain {
+        if let Some(nxdomain_bytes) = qr.nxdomain {
             let len_bytes = (nxdomain_bytes.len() as u16).to_be_bytes();
             stream.write_all(&len_bytes).await?;
             stream.write_all(&nxdomain_bytes).await?;
-            Self::log_outcome(src, &domain, "blocked", start.elapsed().as_millis(), "tcp");
+            let latency = start.elapsed().as_millis();
+            ctx.metrics.record("blocked", latency as u64);
+            Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "tcp");
             return Ok(());
         }
 
@@ -280,7 +372,9 @@ impl DnsProxy {
         let len_bytes = (response_data.len() as u16).to_be_bytes();
         stream.write_all(&len_bytes).await?;
         stream.write_all(&response_data).await?;
-        Self::log_outcome(src, &domain, "allowed", start.elapsed().as_millis(), proto);
+        let latency = start.elapsed().as_millis();
+        ctx.metrics.record("allowed", latency as u64);
+        Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
 
         Ok(())
     }
@@ -339,22 +433,30 @@ impl DnsProxy {
         Ok(resp.to_vec())
     }
 
-    /// Returns the queried domain and, if blocked, the NXDOMAIN response bytes.
+    /// Parses the DNS query, extracts domain + qtype, checks the blocklist.
     fn check_blocklist(
         query_data: &[u8],
         bloom: &Option<BloomFilter>,
         trie: &DomainTrie,
-    ) -> (String, Option<Vec<u8>>) {
+    ) -> QueryResult {
         let message = match Message::from_bytes(query_data) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "failed to parse DNS query");
-                return (String::new(), None);
+                return QueryResult {
+                    domain: String::new(),
+                    qtype: String::new(),
+                    nxdomain: None,
+                };
             }
         };
         let Some(query) = message.queries().first() else {
             warn!("DNS query has no question section");
-            return (String::new(), None);
+            return QueryResult {
+                domain: String::new(),
+                qtype: String::new(),
+                nxdomain: None,
+            };
         };
         let domain = query
             .name()
@@ -362,13 +464,18 @@ impl DnsProxy {
             .to_lowercase()
             .trim_end_matches('.')
             .to_string();
+        let qtype = query.query_type().to_string();
 
         // Stage 1: bloom pre-filter — check domain and each parent label.
         // A miss on every ancestor means definitely not blocked; skip the trie.
         if let Some(bl) = bloom {
             let maybe_blocked = Self::ancestors(&domain).any(|d| bl.contains(&d));
             if !maybe_blocked {
-                return (domain, None);
+                return QueryResult {
+                    domain,
+                    qtype,
+                    nxdomain: None,
+                };
             }
         }
 
@@ -381,14 +488,26 @@ impl DnsProxy {
             response.take_additionals();
             response.take_name_servers();
             match response.to_bytes() {
-                Ok(bytes) => (domain, Some(bytes)),
+                Ok(bytes) => QueryResult {
+                    domain,
+                    qtype,
+                    nxdomain: Some(bytes),
+                },
                 Err(e) => {
                     warn!(domain = %domain, error = %e, "failed to serialize NXDOMAIN response");
-                    (domain, None)
+                    QueryResult {
+                        domain,
+                        qtype,
+                        nxdomain: None,
+                    }
                 }
             }
         } else {
-            (domain, None)
+            QueryResult {
+                domain,
+                qtype,
+                nxdomain: None,
+            }
         }
     }
 
@@ -397,10 +516,18 @@ impl DnsProxy {
         std::iter::successors(Some(domain), |d| d.find('.').map(|i| &d[i + 1..]))
     }
 
-    fn log_outcome(src: SocketAddr, domain: &str, action: &str, latency_ms: u128, proto: &str) {
+    fn log_outcome(
+        src: SocketAddr,
+        domain: &str,
+        qtype: &str,
+        action: &str,
+        latency_ms: u128,
+        proto: &str,
+    ) {
         info!(
             src = %src,
             domain = %domain,
+            qtype = %qtype,
             action = %action,
             latency_ms = %latency_ms,
             proto = %proto,
@@ -505,13 +632,14 @@ mod tests {
         trie.insert("evil.com");
 
         let query = make_query("evil.com");
-        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+        let qr = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
 
-        assert_eq!(domain, "evil.com");
-        assert!(nxdomain.is_some());
+        assert_eq!(qr.domain, "evil.com");
+        assert_eq!(qr.qtype, "A");
+        assert!(qr.nxdomain.is_some());
 
         // Verify the response is NXDOMAIN
-        let resp = Message::from_bytes(&nxdomain.unwrap()).unwrap();
+        let resp = Message::from_bytes(&qr.nxdomain.unwrap()).unwrap();
         assert_eq!(resp.response_code(), ResponseCode::NXDomain);
         assert_eq!(resp.message_type(), MessageType::Response);
         assert!(resp.answers().is_empty());
@@ -525,10 +653,10 @@ mod tests {
         trie.insert("evil.com");
 
         let query = make_query("google.com");
-        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+        let qr = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
 
-        assert_eq!(domain, "google.com");
-        assert!(nxdomain.is_none());
+        assert_eq!(qr.domain, "google.com");
+        assert!(qr.nxdomain.is_none());
     }
 
     #[test]
@@ -539,10 +667,10 @@ mod tests {
         trie.insert("malware.com");
 
         let query = make_query("sub.malware.com");
-        let (domain, nxdomain) = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
+        let qr = DnsProxy::check_blocklist(&query, &Some(bloom), &trie);
 
-        assert_eq!(domain, "sub.malware.com");
-        assert!(nxdomain.is_some());
+        assert_eq!(qr.domain, "sub.malware.com");
+        assert!(qr.nxdomain.is_some());
     }
 
     #[test]
@@ -551,17 +679,20 @@ mod tests {
         trie.insert("evil.com");
 
         let query = make_query("evil.com");
-        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &None, &trie);
-        assert!(nxdomain.is_some(), "should block even without bloom filter");
+        let qr = DnsProxy::check_blocklist(&query, &None, &trie);
+        assert!(
+            qr.nxdomain.is_some(),
+            "should block even without bloom filter"
+        );
     }
 
     #[test]
     fn check_blocklist_handles_invalid_dns() {
         let trie = DomainTrie::new();
         let garbage = vec![0xFF, 0x00, 0x01];
-        let (domain, nxdomain) = DnsProxy::check_blocklist(&garbage, &None, &trie);
-        assert!(domain.is_empty());
-        assert!(nxdomain.is_none());
+        let qr = DnsProxy::check_blocklist(&garbage, &None, &trie);
+        assert!(qr.domain.is_empty());
+        assert!(qr.nxdomain.is_none());
     }
 
     #[test]
@@ -573,9 +704,9 @@ mod tests {
 
         let query_bytes = make_query("evil.com");
         let original = Message::from_bytes(&query_bytes).unwrap();
-        let (_, nxdomain) = DnsProxy::check_blocklist(&query_bytes, &Some(bloom), &trie);
+        let qr = DnsProxy::check_blocklist(&query_bytes, &Some(bloom), &trie);
 
-        let resp = Message::from_bytes(&nxdomain.unwrap()).unwrap();
+        let resp = Message::from_bytes(&qr.nxdomain.unwrap()).unwrap();
         assert_eq!(resp.id(), original.id(), "response ID must match query ID");
     }
 
@@ -589,8 +720,8 @@ mod tests {
         // Initially empty — nothing blocked
         let query = make_query("evil.com");
         let bl = blocklist.load();
-        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
-        assert!(nxdomain.is_none(), "should not be blocked before reload");
+        let qr = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
+        assert!(qr.nxdomain.is_none(), "should not be blocked before reload");
 
         // Simulate a reload: build new blocklist with evil.com
         let mut new_bloom = BloomFilter::new(10, 0.01);
@@ -604,7 +735,22 @@ mod tests {
 
         // After reload — evil.com is blocked
         let bl = blocklist.load();
-        let (_, nxdomain) = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
-        assert!(nxdomain.is_some(), "should be blocked after reload");
+        let qr = DnsProxy::check_blocklist(&query, &bl.bloom, &bl.trie);
+        assert!(qr.nxdomain.is_some(), "should be blocked after reload");
+    }
+
+    #[test]
+    fn metrics_record_and_snapshot() {
+        let m = QueryMetrics::new();
+        m.record("blocked", 5);
+        m.record("allowed", 15);
+        m.record("allowed", 10);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(snap.allowed, 2);
+        assert_eq!(snap.total_latency_ms, 30);
+        assert!((snap.avg_latency_ms() - 10.0).abs() < f64::EPSILON);
     }
 }
