@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -26,6 +27,7 @@ pub struct QueryMetrics {
     pub blocked: AtomicU64,
     pub allowed: AtomicU64,
     pub total_latency_ms: AtomicU64,
+    blocked_domains: Mutex<HashMap<String, u64>>,
 }
 
 impl QueryMetrics {
@@ -35,22 +37,39 @@ impl QueryMetrics {
             blocked: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
+            blocked_domains: Mutex::new(HashMap::new()),
         }
     }
 
-    fn record(&self, action: &str, latency_ms: u64) {
+    fn record(&self, action: &str, latency_ms: u64, domain: &str) {
         self.total.fetch_add(1, Ordering::Relaxed);
         self.total_latency_ms
             .fetch_add(latency_ms, Ordering::Relaxed);
         match action {
             "blocked" => {
                 self.blocked.fetch_add(1, Ordering::Relaxed);
+                *self
+                    .blocked_domains
+                    .lock()
+                    .unwrap()
+                    .entry(domain.to_string())
+                    .or_insert(0) += 1;
             }
             "allowed" => {
                 self.allowed.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
+    }
+
+    /// Returns the top `n` blocked domains sorted by count (descending).
+    #[allow(dead_code)]
+    pub fn top_blocked(&self, n: usize) -> Vec<(String, u64)> {
+        let map = self.blocked_domains.lock().unwrap();
+        let mut entries: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(n);
+        entries
     }
 
     #[allow(dead_code)]
@@ -236,7 +255,7 @@ impl DnsProxy {
             if let Some(nxdomain_bytes) = qr.nxdomain {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
                 let latency = start.elapsed().as_millis();
-                metrics.record("blocked", latency as u64);
+                metrics.record("blocked", latency as u64, &qr.domain);
                 Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "udp");
                 continue;
             }
@@ -256,7 +275,7 @@ impl DnsProxy {
                         error!(src = %src, error = %e, "failed to send response");
                     }
                     let latency = start.elapsed().as_millis();
-                    metrics.record("allowed", latency as u64);
+                    metrics.record("allowed", latency as u64, &qr.domain);
                     Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
                 }
                 Err(e) => {
@@ -340,7 +359,7 @@ impl DnsProxy {
             stream.write_all(&len_bytes).await?;
             stream.write_all(&nxdomain_bytes).await?;
             let latency = start.elapsed().as_millis();
-            ctx.metrics.record("blocked", latency as u64);
+            ctx.metrics.record("blocked", latency as u64, &qr.domain);
             Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "tcp");
             return Ok(());
         }
@@ -373,7 +392,7 @@ impl DnsProxy {
         stream.write_all(&len_bytes).await?;
         stream.write_all(&response_data).await?;
         let latency = start.elapsed().as_millis();
-        ctx.metrics.record("allowed", latency as u64);
+        ctx.metrics.record("allowed", latency as u64, &qr.domain);
         Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
 
         Ok(())
@@ -742,9 +761,9 @@ mod tests {
     #[test]
     fn metrics_record_and_snapshot() {
         let m = QueryMetrics::new();
-        m.record("blocked", 5);
-        m.record("allowed", 15);
-        m.record("allowed", 10);
+        m.record("blocked", 5, "evil.com");
+        m.record("allowed", 15, "google.com");
+        m.record("allowed", 10, "github.com");
 
         let snap = m.snapshot();
         assert_eq!(snap.total, 3);
@@ -752,5 +771,29 @@ mod tests {
         assert_eq!(snap.allowed, 2);
         assert_eq!(snap.total_latency_ms, 30);
         assert!((snap.avg_latency_ms() - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn top_blocked_returns_sorted() {
+        let m = QueryMetrics::new();
+        m.record("blocked", 1, "evil.com");
+        m.record("blocked", 1, "evil.com");
+        m.record("blocked", 1, "evil.com");
+        m.record("blocked", 1, "malware.org");
+        m.record("blocked", 1, "phish.net");
+        m.record("blocked", 1, "phish.net");
+        m.record("allowed", 1, "google.com");
+
+        let top = m.top_blocked(2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0], ("evil.com".to_string(), 3));
+        assert_eq!(top[1], ("phish.net".to_string(), 2));
+    }
+
+    #[test]
+    fn top_blocked_empty() {
+        let m = QueryMetrics::new();
+        m.record("allowed", 1, "google.com");
+        assert!(m.top_blocked(10).is_empty());
     }
 }
