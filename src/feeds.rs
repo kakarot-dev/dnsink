@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+#[allow(async_fn_in_trait)]
 pub trait ThreatFeed {
     fn name(&self) -> &str;
     async fn fetch(&self) -> anyhow::Result<String>;

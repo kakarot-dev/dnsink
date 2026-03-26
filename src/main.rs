@@ -1,9 +1,3 @@
-mod bloom;
-mod config;
-mod feeds;
-mod proxy;
-mod trie;
-
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 
@@ -11,8 +5,8 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use config::{Config, LogFormat};
-use proxy::{load_blocklist, DnsProxy};
+use dnsink::config::{Config, LogFormat};
+use dnsink::proxy::{load_blocklist, DnsProxy};
 
 #[derive(Parser)]
 #[command(name = "dnsink", about = "DNS threat gateway")]

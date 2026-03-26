@@ -30,6 +30,12 @@ pub struct QueryMetrics {
     blocked_domains: Mutex<HashMap<String, u64>>,
 }
 
+impl Default for QueryMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QueryMetrics {
     pub fn new() -> Self {
         Self {
