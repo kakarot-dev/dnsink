@@ -2,11 +2,13 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use clap::Parser;
+use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use dnsink::config::{Config, LogFormat};
 use dnsink::proxy::{load_blocklist, DnsProxy};
+use dnsink::tui::App;
 
 #[derive(Parser)]
 #[command(name = "dnsink", about = "DNS threat gateway")]
@@ -14,6 +16,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Launch the TUI dashboard
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
@@ -26,7 +32,9 @@ async fn main() -> anyhow::Result<()> {
         Config::default()
     };
 
-    init_tracing(&config)?;
+    if !cli.tui {
+        init_tracing(&config)?;
+    }
 
     info!(
         listen = %format!("{}:{}", config.listen.address, config.listen.port),
@@ -36,8 +44,25 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (bloom, trie) = load_blocklist(&config).await?;
-    let proxy = DnsProxy::new(config, bloom, trie)?;
-    proxy.run().await
+    let mut proxy = DnsProxy::new(config, bloom, trie)?;
+
+    if cli.tui {
+        let (tx, rx) = mpsc::channel(1024);
+        let metrics = proxy.metrics();
+        proxy.set_event_tx(tx);
+
+        // Run proxy in background, TUI in foreground
+        tokio::spawn(async move {
+            if let Err(e) = proxy.run().await {
+                eprintln!("proxy error: {e}");
+            }
+        });
+
+        let app = App::new(metrics, rx);
+        app.run().await
+    } else {
+        proxy.run().await
+    }
 }
 
 fn init_tracing(config: &Config) -> anyhow::Result<()> {

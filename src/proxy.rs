@@ -12,10 +12,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
+use tokio::sync::mpsc;
+
 use crate::bloom::BloomFilter;
 use crate::config::{Config, UpstreamProtocol};
 use crate::feeds;
 use crate::trie::DomainTrie;
+use crate::tui::QueryEvent;
 
 /// Maximum DNS message size with EDNS0 support
 const MAX_DNS_MSG_SIZE: usize = 4096;
@@ -133,6 +136,7 @@ struct TcpClientCtx<'a> {
     doh_url: &'a str,
     fwd_socket: &'a UdpSocket,
     metrics: &'a QueryMetrics,
+    event_tx: &'a Option<mpsc::Sender<QueryEvent>>,
 }
 
 pub struct DnsProxy {
@@ -140,6 +144,7 @@ pub struct DnsProxy {
     blocklist: Arc<ArcSwap<Blocklist>>,
     http: reqwest::Client,
     metrics: Arc<QueryMetrics>,
+    event_tx: Option<mpsc::Sender<QueryEvent>>,
 }
 
 impl DnsProxy {
@@ -156,12 +161,17 @@ impl DnsProxy {
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
             http,
             metrics: Arc::new(QueryMetrics::new()),
+            event_tx: None,
         })
     }
 
     #[allow(dead_code)]
     pub fn metrics(&self) -> Arc<QueryMetrics> {
         self.metrics.clone()
+    }
+
+    pub fn set_event_tx(&mut self, tx: mpsc::Sender<QueryEvent>) {
+        self.event_tx = Some(tx);
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -186,8 +196,11 @@ impl DnsProxy {
         let blocklist = self.blocklist.clone();
         let http = self.http.clone();
         let metrics = self.metrics.clone();
+        let event_tx = self.event_tx.clone();
         let udp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(udp_socket, &config, &blocklist, &http, &metrics).await {
+            if let Err(e) =
+                Self::run_udp(udp_socket, &config, &blocklist, &http, &metrics, &event_tx).await
+            {
                 error!(error = %e, "UDP listener failed");
             }
         });
@@ -196,8 +209,11 @@ impl DnsProxy {
         let blocklist = self.blocklist.clone();
         let http = self.http.clone();
         let metrics = self.metrics.clone();
+        let event_tx = self.event_tx.clone();
         let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_tcp(tcp_listener, config, blocklist, http, metrics).await {
+            if let Err(e) =
+                Self::run_tcp(tcp_listener, config, blocklist, http, metrics, event_tx).await
+            {
                 error!(error = %e, "TCP listener failed");
             }
         });
@@ -241,6 +257,7 @@ impl DnsProxy {
         blocklist: &ArcSwap<Blocklist>,
         http: &reqwest::Client,
         metrics: &QueryMetrics,
+        event_tx: &Option<mpsc::Sender<QueryEvent>>,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
@@ -262,6 +279,14 @@ impl DnsProxy {
                 let _ = socket.send_to(&nxdomain_bytes, src).await;
                 let latency = start.elapsed().as_millis();
                 metrics.record("blocked", latency as u64, &qr.domain);
+                Self::emit_event(
+                    event_tx,
+                    &qr.domain,
+                    &qr.qtype,
+                    "blocked",
+                    latency as u64,
+                    "udp",
+                );
                 Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "udp");
                 continue;
             }
@@ -282,6 +307,14 @@ impl DnsProxy {
                     }
                     let latency = start.elapsed().as_millis();
                     metrics.record("allowed", latency as u64, &qr.domain);
+                    Self::emit_event(
+                        event_tx,
+                        &qr.domain,
+                        &qr.qtype,
+                        "allowed",
+                        latency as u64,
+                        proto,
+                    );
                     Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
                 }
                 Err(e) => {
@@ -297,9 +330,11 @@ impl DnsProxy {
         blocklist: Arc<ArcSwap<Blocklist>>,
         http: reqwest::Client,
         metrics: Arc<QueryMetrics>,
+        event_tx: Option<mpsc::Sender<QueryEvent>>,
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
+        let event_tx = Arc::new(event_tx);
         // Shared forwarding socket for UDP-first upstream, reused across connections
         let fwd_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         loop {
@@ -315,6 +350,7 @@ impl DnsProxy {
             let doh_url = doh_url.clone();
             let fwd_socket = fwd_socket.clone();
             let metrics = metrics.clone();
+            let event_tx = event_tx.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
@@ -329,6 +365,7 @@ impl DnsProxy {
                     doh_url: &doh_url,
                     fwd_socket: &fwd_socket,
                     metrics: &metrics,
+                    event_tx: &event_tx,
                 };
                 if let Err(e) = Self::handle_tcp_client(stream, src, &ctx).await {
                     warn!(src = %src, error = %e, "TCP client failed");
@@ -366,6 +403,14 @@ impl DnsProxy {
             stream.write_all(&nxdomain_bytes).await?;
             let latency = start.elapsed().as_millis();
             ctx.metrics.record("blocked", latency as u64, &qr.domain);
+            Self::emit_event(
+                ctx.event_tx,
+                &qr.domain,
+                &qr.qtype,
+                "blocked",
+                latency as u64,
+                "tcp",
+            );
             Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "tcp");
             return Ok(());
         }
@@ -399,6 +444,14 @@ impl DnsProxy {
         stream.write_all(&response_data).await?;
         let latency = start.elapsed().as_millis();
         ctx.metrics.record("allowed", latency as u64, &qr.domain);
+        Self::emit_event(
+            ctx.event_tx,
+            &qr.domain,
+            &qr.qtype,
+            "allowed",
+            latency as u64,
+            proto,
+        );
         Self::log_outcome(src, &qr.domain, &qr.qtype, "allowed", latency, proto);
 
         Ok(())
@@ -558,6 +611,26 @@ impl DnsProxy {
             proto = %proto,
             "query"
         );
+    }
+
+    fn emit_event(
+        tx: &Option<mpsc::Sender<QueryEvent>>,
+        domain: &str,
+        qtype: &str,
+        action: &str,
+        latency_ms: u64,
+        proto: &str,
+    ) {
+        if let Some(tx) = tx {
+            let _ = tx.try_send(QueryEvent {
+                timestamp: Instant::now(),
+                domain: domain.to_string(),
+                qtype: qtype.to_string(),
+                action: action.to_string(),
+                latency_ms,
+                proto: proto.to_string(),
+            });
+        }
     }
 }
 
