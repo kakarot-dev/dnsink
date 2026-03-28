@@ -1,4 +1,26 @@
-# Example blocklist — one domain per line
+# Static blocklist — known malicious domains
 malware.example.com
 evil.example.com
 tracker.adnetwork.com
+c2-relay.darkops.net
+payload-drop.malware-cdn.ru
+exfil-gateway.data-harvest.cn
+phish-login.secure-bankofamerica.com
+keylogger-c2.shadownet.io
+ransomware-drop.cryptolock.xyz
+botnet-controller.stormworm.cc
+trojan-callback.apt-group41.org
+credential-stealer.phishkit.pro
+dropper-stage2.malbin.net
+dns-tunnel.covertchannel.top
+miner-pool-proxy.cryptojack.ru
+rat-c2-primary.ghostshell.cc
+webshell-gate.backdoor-factory.cn
+fake-update.chrome-download.xyz
+spyware-beacon.surveil.io
+exploit-kit.angler-ek.net
+loader-c2.emotet-wave3.com
+stealer-exfil.redline-stealer.ru
+apt-implant.lazarus-group.cc
+wiper-c2.shamoon-ops.net
+skimmer-gate.magecart-group7.com

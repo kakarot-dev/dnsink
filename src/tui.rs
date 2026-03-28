@@ -31,8 +31,8 @@ const MAX_EVENTS: usize = 200;
 /// TUI refresh rate.
 const TICK_RATE: Duration = Duration::from_millis(100);
 
-/// Seconds of history for the sparkline.
-const SPARKLINE_SECS: usize = 60;
+/// Seconds of history for the sparkline (enough to fill wide terminals).
+const SPARKLINE_SECS: usize = 300;
 
 pub struct App {
     events: VecDeque<QueryEvent>,
@@ -251,7 +251,18 @@ impl App {
     }
 
     fn render_sparkline(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let data: Vec<u64> = self.qps_history.iter().copied().collect();
+        // Take only as many data points as the widget can display (width minus borders)
+        let available_width = area.width.saturating_sub(2) as usize;
+        let data: Vec<u64> = self
+            .qps_history
+            .iter()
+            .copied()
+            .rev()
+            .take(available_width)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         let current_qps = self.qps_current;
         let peak = data.iter().copied().max().unwrap_or(0).max(current_qps);
         let title = format!(" Queries/sec (last 60s)  now: {current_qps}  peak: {peak} ");
