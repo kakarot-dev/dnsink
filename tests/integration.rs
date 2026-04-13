@@ -58,6 +58,7 @@ fn test_config(port: u16) -> Config {
             refresh_secs: 0,
         },
         logging: LoggingConfig::default(),
+        tunneling_detection: Default::default(),
     }
 }
 

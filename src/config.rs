@@ -13,6 +13,36 @@ pub struct Config {
     pub feeds: FeedsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub tunneling_detection: TunnelingDetectionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TunnelingDetectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_entropy_threshold")]
+    pub entropy_threshold: f64,
+    #[serde(default = "default_min_subdomain_length")]
+    pub min_subdomain_length: usize,
+}
+
+fn default_entropy_threshold() -> f64 {
+    3.5
+}
+
+fn default_min_subdomain_length() -> usize {
+    20
+}
+
+impl Default for TunnelingDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            entropy_threshold: default_entropy_threshold(),
+            min_subdomain_length: default_min_subdomain_length(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq)]
@@ -119,6 +149,7 @@ impl Default for Config {
                 refresh_secs: 3600,
             },
             logging: LoggingConfig::default(),
+            tunneling_detection: TunnelingDetectionConfig::default(),
         }
     }
 }
