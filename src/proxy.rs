@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::bloom::BloomFilter;
 use crate::config::{Config, UpstreamProtocol};
+use crate::entropy::EntropyDetector;
 use crate::feeds;
 use crate::trie::DomainTrie;
 use crate::tui::QueryEvent;
@@ -30,6 +31,7 @@ pub struct QueryMetrics {
     pub blocked: AtomicU64,
     pub allowed: AtomicU64,
     pub total_latency_ms: AtomicU64,
+    pub tunneling_flagged: AtomicU64,
     blocked_domains: Mutex<HashMap<String, u64>>,
 }
 
@@ -46,8 +48,15 @@ impl QueryMetrics {
             blocked: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
+            tunneling_flagged: AtomicU64::new(0),
             blocked_domains: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Increment the tunneling-flagged counter. Called when the entropy
+    /// detector marks a query as suspicious.
+    fn record_tunneling_flag(&self) {
+        self.tunneling_flagged.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record(&self, action: &str, latency_ms: u64, domain: &str) {
@@ -88,6 +97,7 @@ impl QueryMetrics {
             blocked: self.blocked.load(Ordering::Relaxed),
             allowed: self.allowed.load(Ordering::Relaxed),
             total_latency_ms: self.total_latency_ms.load(Ordering::Relaxed),
+            tunneling_flagged: self.tunneling_flagged.load(Ordering::Relaxed),
         }
     }
 }
@@ -99,6 +109,7 @@ pub struct MetricsSnapshot {
     pub blocked: u64,
     pub allowed: u64,
     pub total_latency_ms: u64,
+    pub tunneling_flagged: u64,
 }
 
 impl MetricsSnapshot {
@@ -137,6 +148,7 @@ struct TcpClientCtx<'a> {
     fwd_socket: &'a UdpSocket,
     metrics: &'a QueryMetrics,
     event_tx: &'a Option<mpsc::Sender<QueryEvent>>,
+    entropy_detector: Option<&'a EntropyDetector>,
 }
 
 pub struct DnsProxy {
@@ -145,6 +157,8 @@ pub struct DnsProxy {
     http: reqwest::Client,
     metrics: Arc<QueryMetrics>,
     event_tx: Option<mpsc::Sender<QueryEvent>>,
+    /// Present only when `config.tunneling_detection.enabled` is true.
+    entropy_detector: Option<Arc<EntropyDetector>>,
 }
 
 impl DnsProxy {
@@ -156,12 +170,21 @@ impl DnsProxy {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.upstream.timeout_ms))
             .build()?;
+        let entropy_detector = if config.tunneling_detection.enabled {
+            Some(Arc::new(EntropyDetector::new(
+                config.tunneling_detection.entropy_threshold,
+                config.tunneling_detection.min_subdomain_length,
+            )))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
             http,
             metrics: Arc::new(QueryMetrics::new()),
             event_tx: None,
+            entropy_detector,
         })
     }
 
@@ -197,9 +220,18 @@ impl DnsProxy {
         let http = self.http.clone();
         let metrics = self.metrics.clone();
         let event_tx = self.event_tx.clone();
+        let entropy_detector = self.entropy_detector.clone();
         let udp_handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::run_udp(udp_socket, &config, &blocklist, &http, &metrics, &event_tx).await
+            if let Err(e) = Self::run_udp(
+                udp_socket,
+                &config,
+                &blocklist,
+                &http,
+                &metrics,
+                &event_tx,
+                entropy_detector.as_deref(),
+            )
+            .await
             {
                 error!(error = %e, "UDP listener failed");
             }
@@ -210,9 +242,18 @@ impl DnsProxy {
         let http = self.http.clone();
         let metrics = self.metrics.clone();
         let event_tx = self.event_tx.clone();
+        let entropy_detector = self.entropy_detector.clone();
         let tcp_handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::run_tcp(tcp_listener, config, blocklist, http, metrics, event_tx).await
+            if let Err(e) = Self::run_tcp(
+                tcp_listener,
+                config,
+                blocklist,
+                http,
+                metrics,
+                event_tx,
+                entropy_detector,
+            )
+            .await
             {
                 error!(error = %e, "TCP listener failed");
             }
@@ -258,6 +299,7 @@ impl DnsProxy {
         http: &reqwest::Client,
         metrics: &QueryMetrics,
         event_tx: &Option<mpsc::Sender<QueryEvent>>,
+        entropy_detector: Option<&EntropyDetector>,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
@@ -290,6 +332,8 @@ impl DnsProxy {
                 Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "udp");
                 continue;
             }
+
+            Self::check_tunneling(entropy_detector, &qr.domain, metrics);
 
             let response = if use_doh {
                 Self::forward_doh(http, config.doh_url(), &query_data).await
@@ -331,6 +375,7 @@ impl DnsProxy {
         http: reqwest::Client,
         metrics: Arc<QueryMetrics>,
         event_tx: Option<mpsc::Sender<QueryEvent>>,
+        entropy_detector: Option<Arc<EntropyDetector>>,
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
@@ -351,6 +396,7 @@ impl DnsProxy {
             let fwd_socket = fwd_socket.clone();
             let metrics = metrics.clone();
             let event_tx = event_tx.clone();
+            let entropy_detector = entropy_detector.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
@@ -366,6 +412,7 @@ impl DnsProxy {
                     fwd_socket: &fwd_socket,
                     metrics: &metrics,
                     event_tx: &event_tx,
+                    entropy_detector: entropy_detector.as_deref(),
                 };
                 if let Err(e) = Self::handle_tcp_client(stream, src, &ctx).await {
                     warn!(src = %src, error = %e, "TCP client failed");
@@ -414,6 +461,8 @@ impl DnsProxy {
             Self::log_outcome(src, &qr.domain, &qr.qtype, "blocked", latency, "tcp");
             return Ok(());
         }
+
+        Self::check_tunneling(ctx.entropy_detector, &qr.domain, ctx.metrics);
 
         let (response_data, proto) = if ctx.use_doh {
             // DoH handles large responses natively — no truncation retry needed
@@ -611,6 +660,25 @@ impl DnsProxy {
             proto = %proto,
             "query"
         );
+    }
+
+    /// If the detector flags the domain, emit a warning log and bump the
+    /// tunneling counter. No-op when the detector is disabled.
+    fn check_tunneling(
+        detector: Option<&EntropyDetector>,
+        domain: &str,
+        metrics: &QueryMetrics,
+    ) {
+        if let Some(detector) = detector {
+            if detector.is_suspicious(domain) {
+                metrics.record_tunneling_flag();
+                warn!(
+                    domain = %domain,
+                    entropy_flagged = true,
+                    "suspicious high-entropy DNS query (possible tunneling)"
+                );
+            }
+        }
     }
 
     fn emit_event(

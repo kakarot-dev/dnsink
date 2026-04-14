@@ -1,7 +1,7 @@
 use dnsink::entropy::EntropyDetector;
 
 #[test]
-fn detector_is_constructable_and_stub_returns_false() {
+fn normal_domain_not_flagged() {
     let detector = EntropyDetector::new(3.5, 20);
     assert!(!detector.is_suspicious("example.com"));
 }

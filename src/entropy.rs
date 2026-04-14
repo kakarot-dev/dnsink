@@ -6,8 +6,10 @@
 //! cluster around ~3.0 bits/char; base32/base64-encoded payloads land closer
 //! to 4.5+.
 //!
-//! This module only contains the scaffold and the entropy primitive.
-//! The actual suspiciousness classifier lands in a follow-up.
+//! The classifier here is deliberately dumb: for each label long enough to
+//! plausibly hold a payload, compute entropy and compare against a threshold.
+//! No ML, no n-grams, no allowlisting — those can come later if the false
+//! positive rate demands it.
 
 use std::collections::HashMap;
 
@@ -24,10 +26,17 @@ impl EntropyDetector {
         }
     }
 
-    /// Stub: returns false until the classifier is implemented.
-    pub fn is_suspicious(&self, _domain: &str) -> bool {
-        let _ = (self.threshold, self.min_length);
-        false
+    /// Returns true if any label in `domain` is long enough to be a payload
+    /// carrier AND has entropy exceeding the configured threshold.
+    ///
+    /// Short labels (len < min_length) are skipped — they can't meaningfully
+    /// carry a tunneled payload and produce noisy false positives on
+    /// legitimate hex hashes like CDN cache keys.
+    pub fn is_suspicious(&self, domain: &str) -> bool {
+        domain
+            .split('.')
+            .filter(|label| label.len() >= self.min_length)
+            .any(|label| self.shannon_entropy(label) > self.threshold)
     }
 
     /// Shannon entropy in bits/character. Empty strings return 0.0.
@@ -58,5 +67,25 @@ mod tests {
     fn repeated_char_has_lower_entropy_than_mixed() {
         let detector = EntropyDetector::new(3.5, 20);
         assert!(detector.shannon_entropy("aaaa") < detector.shannon_entropy("a1b2c3d4"));
+    }
+
+    #[test]
+    fn normal_domain_is_not_suspicious() {
+        let detector = EntropyDetector::new(3.5, 20);
+        assert!(!detector.is_suspicious("normal.example.com"));
+    }
+
+    #[test]
+    fn long_but_low_entropy_label_is_not_suspicious() {
+        // 23 'a's — long enough to be checked, but zero entropy.
+        let detector = EntropyDetector::new(3.5, 20);
+        assert!(!detector.is_suspicious("aaaaaaaaaaaaaaaaaaaaaaa.example.com"));
+    }
+
+    #[test]
+    fn long_high_entropy_label_is_suspicious() {
+        // 27 distinct base36-ish chars — looks like a dnscat2 payload.
+        let detector = EntropyDetector::new(3.5, 20);
+        assert!(detector.is_suspicious("k8j4h2g9f7d5s3a1q6w8e4r2t0y.example.com"));
     }
 }
