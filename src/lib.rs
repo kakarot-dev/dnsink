@@ -1,4 +1,5 @@
 pub mod bloom;
+pub mod cdn_whitelist;
 pub mod config;
 pub mod entropy;
 pub mod feeds;

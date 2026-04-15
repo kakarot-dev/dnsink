@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::bloom::BloomFilter;
+use crate::cdn_whitelist::CdnWhitelist;
 use crate::config::{Config, UpstreamProtocol};
 use crate::entropy::EntropyDetector;
 use crate::feeds;
@@ -149,6 +150,7 @@ struct TcpClientCtx<'a> {
     metrics: &'a QueryMetrics,
     event_tx: &'a Option<mpsc::Sender<QueryEvent>>,
     entropy_detector: Option<&'a EntropyDetector>,
+    cdn_whitelist: Option<&'a CdnWhitelist>,
 }
 
 pub struct DnsProxy {
@@ -159,6 +161,10 @@ pub struct DnsProxy {
     event_tx: Option<mpsc::Sender<QueryEvent>>,
     /// Present only when `config.tunneling_detection.enabled` is true.
     entropy_detector: Option<Arc<EntropyDetector>>,
+    /// Present only when the CDN whitelist is enabled AND has at least one
+    /// provider configured. Used to suppress entropy false positives on
+    /// trusted CDNs before the entropy check runs.
+    cdn_whitelist: Option<Arc<CdnWhitelist>>,
 }
 
 impl DnsProxy {
@@ -178,6 +184,12 @@ impl DnsProxy {
         } else {
             None
         };
+        let cdn_cfg = &config.tunneling_detection.cdn_whitelist;
+        let cdn_whitelist = if cdn_cfg.enabled && !cdn_cfg.providers.is_empty() {
+            Some(Arc::new(CdnWhitelist::with_providers(&cdn_cfg.providers)))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
@@ -185,6 +197,7 @@ impl DnsProxy {
             metrics: Arc::new(QueryMetrics::new()),
             event_tx: None,
             entropy_detector,
+            cdn_whitelist,
         })
     }
 
@@ -221,6 +234,7 @@ impl DnsProxy {
         let metrics = self.metrics.clone();
         let event_tx = self.event_tx.clone();
         let entropy_detector = self.entropy_detector.clone();
+        let cdn_whitelist = self.cdn_whitelist.clone();
         let udp_handle = tokio::spawn(async move {
             if let Err(e) = Self::run_udp(
                 udp_socket,
@@ -230,6 +244,7 @@ impl DnsProxy {
                 &metrics,
                 &event_tx,
                 entropy_detector.as_deref(),
+                cdn_whitelist.as_deref(),
             )
             .await
             {
@@ -243,6 +258,7 @@ impl DnsProxy {
         let metrics = self.metrics.clone();
         let event_tx = self.event_tx.clone();
         let entropy_detector = self.entropy_detector.clone();
+        let cdn_whitelist = self.cdn_whitelist.clone();
         let tcp_handle = tokio::spawn(async move {
             if let Err(e) = Self::run_tcp(
                 tcp_listener,
@@ -252,6 +268,7 @@ impl DnsProxy {
                 metrics,
                 event_tx,
                 entropy_detector,
+                cdn_whitelist,
             )
             .await
             {
@@ -292,6 +309,7 @@ impl DnsProxy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_udp(
         socket: UdpSocket,
         config: &Config,
@@ -300,6 +318,7 @@ impl DnsProxy {
         metrics: &QueryMetrics,
         event_tx: &Option<mpsc::Sender<QueryEvent>>,
         entropy_detector: Option<&EntropyDetector>,
+        cdn_whitelist: Option<&CdnWhitelist>,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
@@ -333,7 +352,7 @@ impl DnsProxy {
                 continue;
             }
 
-            Self::check_tunneling(entropy_detector, &qr.domain, metrics);
+            Self::check_tunneling(entropy_detector, cdn_whitelist, &qr.domain, metrics);
 
             let response = if use_doh {
                 Self::forward_doh(http, config.doh_url(), &query_data).await
@@ -368,6 +387,7 @@ impl DnsProxy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tcp(
         listener: TcpListener,
         config: Arc<Config>,
@@ -376,6 +396,7 @@ impl DnsProxy {
         metrics: Arc<QueryMetrics>,
         event_tx: Option<mpsc::Sender<QueryEvent>>,
         entropy_detector: Option<Arc<EntropyDetector>>,
+        cdn_whitelist: Option<Arc<CdnWhitelist>>,
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
@@ -397,6 +418,7 @@ impl DnsProxy {
             let metrics = metrics.clone();
             let event_tx = event_tx.clone();
             let entropy_detector = entropy_detector.clone();
+            let cdn_whitelist = cdn_whitelist.clone();
 
             // Spawn a task per TCP connection so we don't block the accept loop
             tokio::spawn(async move {
@@ -413,6 +435,7 @@ impl DnsProxy {
                     metrics: &metrics,
                     event_tx: &event_tx,
                     entropy_detector: entropy_detector.as_deref(),
+                    cdn_whitelist: cdn_whitelist.as_deref(),
                 };
                 if let Err(e) = Self::handle_tcp_client(stream, src, &ctx).await {
                     warn!(src = %src, error = %e, "TCP client failed");
@@ -462,7 +485,12 @@ impl DnsProxy {
             return Ok(());
         }
 
-        Self::check_tunneling(ctx.entropy_detector, &qr.domain, ctx.metrics);
+        Self::check_tunneling(
+            ctx.entropy_detector,
+            ctx.cdn_whitelist,
+            &qr.domain,
+            ctx.metrics,
+        );
 
         let (response_data, proto) = if ctx.use_doh {
             // DoH handles large responses natively — no truncation retry needed
@@ -663,21 +691,30 @@ impl DnsProxy {
     }
 
     /// If the detector flags the domain, emit a warning log and bump the
-    /// tunneling counter. No-op when the detector is disabled.
+    /// tunneling counter. Trusted CDN domains short-circuit before the
+    /// entropy check to suppress known false positives. No-op when the
+    /// detector is disabled.
     fn check_tunneling(
         detector: Option<&EntropyDetector>,
+        cdn_whitelist: Option<&CdnWhitelist>,
         domain: &str,
         metrics: &QueryMetrics,
     ) {
-        if let Some(detector) = detector {
-            if detector.is_suspicious(domain) {
-                metrics.record_tunneling_flag();
-                warn!(
-                    domain = %domain,
-                    entropy_flagged = true,
-                    "suspicious high-entropy DNS query (possible tunneling)"
-                );
+        let Some(detector) = detector else { return };
+
+        if let Some(cdn) = cdn_whitelist {
+            if cdn.is_cdn(domain) {
+                return;
             }
+        }
+
+        if detector.is_suspicious(domain) {
+            metrics.record_tunneling_flag();
+            warn!(
+                domain = %domain,
+                entropy_flagged = true,
+                "suspicious high-entropy DNS query (possible tunneling)"
+            );
         }
     }
 

@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::cdn_whitelist::CdnProvider;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub listen: ListenConfig,
@@ -25,6 +27,8 @@ pub struct TunnelingDetectionConfig {
     pub entropy_threshold: f64,
     #[serde(default = "default_min_subdomain_length")]
     pub min_subdomain_length: usize,
+    #[serde(default)]
+    pub cdn_whitelist: CdnWhitelistConfig,
 }
 
 fn default_entropy_threshold() -> f64 {
@@ -41,6 +45,24 @@ impl Default for TunnelingDetectionConfig {
             enabled: false,
             entropy_threshold: default_entropy_threshold(),
             min_subdomain_length: default_min_subdomain_length(),
+            cdn_whitelist: CdnWhitelistConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CdnWhitelistConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub providers: Vec<CdnProvider>,
+}
+
+impl Default for CdnWhitelistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            providers: Vec::new(),
         }
     }
 }

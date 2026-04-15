@@ -23,3 +23,7 @@ refresh_secs = 3600
 enabled = false
 entropy_threshold = 3.5
 min_subdomain_length = 20
+
+[tunneling_detection.cdn_whitelist]
+enabled = true
+providers = ["aws", "akamai", "cloudflare"]
