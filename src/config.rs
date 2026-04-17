@@ -17,6 +17,29 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub tunneling_detection: TunnelingDetectionConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_bind_addr")]
+    pub bind_addr: String,
+}
+
+fn default_metrics_bind_addr() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_addr: default_metrics_bind_addr(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +195,7 @@ impl Default for Config {
             },
             logging: LoggingConfig::default(),
             tunneling_detection: TunnelingDetectionConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }

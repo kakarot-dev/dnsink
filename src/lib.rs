@@ -3,6 +3,7 @@ pub mod cdn_whitelist;
 pub mod config;
 pub mod entropy;
 pub mod feeds;
+pub mod metrics_server;
 pub mod proxy;
 pub mod trie;
 pub mod tui;

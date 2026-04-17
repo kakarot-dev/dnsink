@@ -27,3 +27,7 @@ min_subdomain_length = 20
 [tunneling_detection.cdn_whitelist]
 enabled = true
 providers = ["aws", "akamai", "cloudflare"]
+
+[metrics]
+enabled = true
+bind_addr = "127.0.0.1:9090"

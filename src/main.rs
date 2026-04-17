@@ -2,11 +2,13 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use clap::Parser;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use dnsink::config::{Config, LogFormat};
+use dnsink::metrics_server;
 use dnsink::proxy::{load_blocklist, DnsProxy};
 use dnsink::tui::App;
 
@@ -44,7 +46,26 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (bloom, trie) = load_blocklist(&config).await?;
+    let metrics_cfg = config.metrics.clone();
     let mut proxy = DnsProxy::new(config, bloom, trie)?;
+
+    if metrics_cfg.enabled {
+        let metrics = proxy.metrics();
+        let bind_addr = metrics_cfg.bind_addr.clone();
+        match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => {
+                info!(addr = %bind_addr, "spawning metrics server");
+                tokio::spawn(async move {
+                    if let Err(e) = metrics_server::serve(listener, metrics).await {
+                        error!(error = %e, "metrics server exited");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(addr = %bind_addr, error = %e, "metrics bind failed — continuing without /metrics");
+            }
+        }
+    }
 
     if cli.tui {
         let (tx, rx) = mpsc::channel(1024);
