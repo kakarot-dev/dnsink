@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.gitignore
+Dockerfile
+.dockerignore
+*.md
+LICENSE
+demo-queries.sh
+tests/
