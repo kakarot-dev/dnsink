@@ -86,7 +86,7 @@ impl QueryMetrics {
     pub fn top_blocked(&self, n: usize) -> Vec<(String, u64)> {
         let map = self.blocked_domains.lock().unwrap();
         let mut entries: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
         entries.truncate(n);
         entries
     }

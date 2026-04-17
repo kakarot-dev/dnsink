@@ -157,11 +157,11 @@ impl App {
                             {
                                 self.should_quit = true;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if self.scroll_offset < self.events.len().saturating_sub(1) {
-                                    self.scroll_offset += 1;
-                                    self.auto_scroll = false;
-                                }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if self.scroll_offset < self.events.len().saturating_sub(1) =>
+                            {
+                                self.scroll_offset += 1;
+                                self.auto_scroll = false;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if self.scroll_offset > 0 {
