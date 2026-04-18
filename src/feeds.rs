@@ -60,6 +60,61 @@ impl ThreatFeed for OpenPhishFeed {
     }
 }
 
+// --- oisd (ad/tracker blocklist) ---
+
+pub struct OisdFeed;
+
+const OISD_URL: &str = "https://big.oisd.nl/";
+
+impl ThreatFeed for OisdFeed {
+    fn name(&self) -> &str {
+        "oisd"
+    }
+    async fn fetch(&self) -> anyhow::Result<String> {
+        Ok(reqwest::get(OISD_URL).await?.text().await?)
+    }
+    fn parse(&self, raw: &str) -> Vec<String> {
+        parse_adblock_list(raw)
+    }
+}
+
+/// Parse AdBlock Plus syntax into bare DNS-resolvable domains.
+/// Accepts `||domain^` and `||domain^$modifiers` — rejects rules with
+/// paths, wildcards, or regex markers (not DNS-scoped).
+fn parse_adblock_list(raw: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('!')
+            || line.starts_with('#')
+            || line.starts_with('[')
+        {
+            continue;
+        }
+        let Some(after_anchor) = line.strip_prefix("||") else {
+            continue;
+        };
+        let Some(caret_idx) = after_anchor.find('^') else {
+            continue;
+        };
+        let domain = &after_anchor[..caret_idx];
+        if domain.is_empty()
+            || !domain.contains('.')
+            || domain.contains('/')
+            || domain.contains('*')
+        {
+            continue;
+        }
+        let lower = domain.to_lowercase();
+        if seen.insert(lower.clone()) {
+            domains.push(lower);
+        }
+    }
+    domains
+}
+
 // --- PhishTank ---
 
 pub struct PhishTankFeed {
@@ -152,6 +207,27 @@ mod tests {
         let raw = "# comment\nhttp://evil.com/a\nhttp://evil.com/b\nhttp://other.com/x\n";
         let domains = UrlHausFeed.parse(raw);
         assert_eq!(domains, vec!["evil.com", "other.com"]);
+    }
+
+    #[test]
+    fn oisd_parses_adblock_domains() {
+        let raw = "! Title: oisd big\n[Adblock Plus]\n||ads.example.com^\n||track.net^\n";
+        let domains = OisdFeed.parse(raw);
+        assert_eq!(domains, vec!["ads.example.com", "track.net"]);
+    }
+
+    #[test]
+    fn oisd_strips_modifiers_and_dedupes() {
+        let raw = "||evil.com^\n||evil.com^$third-party\n||other.net^$image,script\n";
+        let domains = OisdFeed.parse(raw);
+        assert_eq!(domains, vec!["evil.com", "other.net"]);
+    }
+
+    #[test]
+    fn oisd_skips_paths_wildcards_and_metadata() {
+        let raw = "! comment\n[metadata]\n||good.com^\n||bad.com/path^\n||*.wild.com^\n||/regex/^\n";
+        let domains = OisdFeed.parse(raw);
+        assert_eq!(domains, vec!["good.com"]);
     }
 
     #[test]

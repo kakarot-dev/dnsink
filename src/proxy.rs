@@ -785,6 +785,9 @@ pub async fn load_blocklist(config: &Config) -> anyhow::Result<(Option<BloomFilt
         )
         .await;
     }
+    if config.feeds.oisd {
+        load_feed(&feeds::OisdFeed, &mut domains).await;
+    }
 
     if domains.is_empty() {
         return Ok((None, DomainTrie::new()));

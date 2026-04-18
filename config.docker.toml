@@ -24,6 +24,7 @@ timeout_ms = 5000
 [feeds]
 urlhaus = true
 openphish = true
+# oisd = true                    # ad/tracker blocking (~200K domains, opt-in)
 refresh_secs = 3600
 
 [tunneling_detection]

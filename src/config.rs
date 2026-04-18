@@ -112,6 +112,10 @@ pub struct FeedsConfig {
     #[serde(default = "default_true")]
     pub openphish: bool,
     pub phishtank_api_key: Option<String>,
+    /// oisd.nl big list (~200K ad/tracker domains, AdBlock syntax).
+    /// Opt-in — appreciably larger than security feeds.
+    #[serde(default)]
+    pub oisd: bool,
     /// Interval in seconds to re-fetch feeds (used by hot-reload)
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
@@ -198,6 +202,7 @@ impl Default for Config {
                 urlhaus: true,
                 openphish: true,
                 phishtank_api_key: None,
+                oisd: false,
                 refresh_secs: 3600,
             },
             logging: LoggingConfig::default(),

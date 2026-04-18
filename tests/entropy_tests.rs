@@ -74,6 +74,7 @@ fn tunneling_test_config(listen_port: u16, upstream_port: u16) -> Config {
             urlhaus: false,
             openphish: false,
             phishtank_api_key: None,
+            oisd: false,
             refresh_secs: 0,
         },
         logging: LoggingConfig::default(),

@@ -45,7 +45,7 @@ cargo run --release -- --tui
 | Prometheus `/metrics` | Yes | No | No | No |
 | Two-stage lookup | ~490 ns | — | — | — |
 
-Unlike Pi-hole and AdGuard Home (ad-blocking focused), dnsink targets active threat infrastructure — C2 servers, phishing pages, malware domains — using feeds that update hourly.
+Unlike Pi-hole and AdGuard Home (ad-blocking focused), dnsink targets active threat infrastructure — C2 servers, phishing pages, malware domains — using feeds that update hourly. The engine is feed-agnostic: ad/tracker blocking is a one-line opt-in via `oisd = true` in config (uses [oisd.nl](https://oisd.nl)'s ~200K-domain list). Point it at any domain list you want.
 
 ## How it works
 

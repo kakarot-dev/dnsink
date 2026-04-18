@@ -56,6 +56,7 @@ fn test_config(port: u16) -> Config {
             urlhaus: false,
             openphish: false,
             phishtank_api_key: None,
+            oisd: false,
             refresh_secs: 0,
         },
         logging: LoggingConfig::default(),
