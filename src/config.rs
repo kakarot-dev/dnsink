@@ -112,8 +112,8 @@ pub struct FeedsConfig {
     #[serde(default = "default_true")]
     pub openphish: bool,
     pub phishtank_api_key: Option<String>,
-    /// oisd.nl big list (~200K ad/tracker domains, AdBlock syntax).
-    /// Opt-in — appreciably larger than security feeds.
+    /// oisd.nl big list (~32K ad/tracker domains, AdBlock syntax).
+    /// Opt-in — expands the blocklist beyond the security-only feeds.
     #[serde(default)]
     pub oisd: bool,
     /// Interval in seconds to re-fetch feeds (used by hot-reload)
