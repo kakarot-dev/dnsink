@@ -42,6 +42,7 @@ fn test_config(port: u16) -> Config {
         listen: ListenConfig {
             address: "127.0.0.1".to_string(),
             port,
+            tcp_address: None,
         },
         upstream: UpstreamConfig {
             address: "8.8.8.8".to_string(),

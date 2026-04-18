@@ -60,6 +60,7 @@ fn tunneling_test_config(listen_port: u16, upstream_port: u16) -> Config {
         listen: ListenConfig {
             address: "127.0.0.1".to_string(),
             port: listen_port,
+            tcp_address: None,
         },
         upstream: UpstreamConfig {
             address: "127.0.0.1".to_string(),

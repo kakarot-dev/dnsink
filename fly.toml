@@ -1,0 +1,48 @@
+# fly.toml — dnsink public deployment
+# Public DNS proxy: UDP + TCP on :53, Prometheus /metrics on :9090.
+# Image is pulled from ghcr.io on each `flyctl deploy`.
+
+app = "dnsink"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# DNS over UDP — fly.io does not rewrite UDP ports, so external must
+# equal internal. Using 5353 since distroless:nonroot can't bind :53
+# without NET_BIND_SERVICE. Clients use: dig @dnsink.fly.dev -p 5353 …
+[[services]]
+  protocol = "udp"
+  internal_port = 5353
+
+  [[services.ports]]
+    port = 5353
+
+# DNS over TCP — fly CAN rewrite TCP ports, so we keep the external
+# DNS-standard :53. Internal still 5353 to match the container bind.
+[[services]]
+  protocol = "tcp"
+  internal_port = 5353
+
+  [[services.ports]]
+    port = 53
+
+# Prometheus /metrics — scrape-ready HTTP endpoint
+[[services]]
+  protocol = "tcp"
+  internal_port = 9090
+
+  [[services.ports]]
+    port = 9090
+    handlers = ["http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "2s"
+    method = "GET"
+    path = "/metrics"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

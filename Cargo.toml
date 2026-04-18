@@ -1,6 +1,6 @@
 [package]
 name = "dnsink"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A high-performance DNS proxy that blocks malware, C2, and phishing at the DNS layer"
 authors = ["Joel Libni <kakarot.joel@gmail.com>"]

@@ -134,6 +134,12 @@ pub struct BlocklistConfig {
 pub struct ListenConfig {
     pub address: String,
     pub port: u16,
+    // Optional TCP-specific bind address. When None, TCP binds to the
+    // same address as UDP. Needed on fly.io where UDP must bind to
+    // `fly-global-services` (for correct reply source-IP) but TCP
+    // must bind to a wildcard so fly-proxy's external route-in lands.
+    #[serde(default)]
+    pub tcp_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq)]
@@ -178,6 +184,7 @@ impl Default for Config {
             listen: ListenConfig {
                 address: "127.0.0.1".to_string(),
                 port: 5353,
+                tcp_address: None,
             },
             upstream: UpstreamConfig {
                 address: "8.8.8.8".to_string(),

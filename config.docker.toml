@@ -4,10 +4,16 @@
 #   docker run -v /path/to/my-config.toml:/etc/dnsink/config.toml:ro ...
 
 [listen]
-# 0.0.0.0 so the container is reachable; 5353 avoids requiring
-# NET_BIND_SERVICE on the nonroot distroless user. Map to host 53 via
-# `-p 53:5353/udp -p 53:5353/tcp`.
-address = "0.0.0.0"
+# fly.io needs asymmetric binding:
+#   UDP must bind to fly-global-services so Linux uses the right source
+#   IP on replies (wildcard binds break UDP on fly).
+#   TCP must bind to a wildcard so fly-proxy's external route-in lands.
+# `tcp_address` overrides the UDP bind address for TCP specifically.
+# 5353 avoids NET_BIND_SERVICE on the distroless nonroot user.
+# For local Docker runs (no fly-global-services), users override the
+# config via `-v` bind-mount.
+address = "fly-global-services"
+tcp_address = "[::]"
 port = 5353
 
 [upstream]
@@ -31,4 +37,4 @@ providers = ["aws", "akamai", "cloudflare"]
 
 [metrics]
 enabled = true
-bind_addr = "0.0.0.0:9090"
+bind_addr = "[::]:9090"

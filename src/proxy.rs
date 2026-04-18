@@ -211,11 +211,20 @@ impl DnsProxy {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        let listen_addr = format!("{}:{}", self.config.listen.address, self.config.listen.port);
+        let port = self.config.listen.port;
+        let udp_addr = format!("{}:{}", self.config.listen.address, port);
+        let tcp_addr = match &self.config.listen.tcp_address {
+            Some(a) => format!("{a}:{port}"),
+            None => udp_addr.clone(),
+        };
 
-        let udp_socket = UdpSocket::bind(&listen_addr).await?;
-        let tcp_listener = TcpListener::bind(&listen_addr).await?;
-        info!("listening on {listen_addr} (UDP + TCP)");
+        let udp_socket = UdpSocket::bind(&udp_addr).await?;
+        let tcp_listener = TcpListener::bind(&tcp_addr).await?;
+        if udp_addr == tcp_addr {
+            info!("listening on {udp_addr} (UDP + TCP)");
+        } else {
+            info!("listening UDP on {udp_addr}, TCP on {tcp_addr}");
+        }
 
         // Spawn hot-reload task
         let reload_config = self.config.clone();
