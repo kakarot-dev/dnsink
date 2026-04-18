@@ -27,10 +27,22 @@ primary_region = "bom"
   [[services.ports]]
     port = 53
 
-# Prometheus /metrics — scrape-ready HTTP endpoint
+# Prometheus /metrics — reachable at:
+#   https://dnsink.fly.dev/metrics    (TLS-terminated by fly-proxy)
+#   http://dnsink.fly.dev/metrics     (redirects to HTTPS)
+#   http://dnsink.fly.dev:9090/metrics (plain HTTP, scraper-friendly)
 [[services]]
   protocol = "tcp"
   internal_port = 9090
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
 
   [[services.ports]]
     port = 9090
