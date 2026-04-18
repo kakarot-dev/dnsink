@@ -225,7 +225,8 @@ mod tests {
 
     #[test]
     fn oisd_skips_paths_wildcards_and_metadata() {
-        let raw = "! comment\n[metadata]\n||good.com^\n||bad.com/path^\n||*.wild.com^\n||/regex/^\n";
+        let raw =
+            "! comment\n[metadata]\n||good.com^\n||bad.com/path^\n||*.wild.com^\n||/regex/^\n";
         let domains = OisdFeed.parse(raw);
         assert_eq!(domains, vec!["good.com"]);
     }
