@@ -1,10 +1,16 @@
 [package]
 name = "dnsink"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "A high-performance DNS proxy that blocks malware, C2, and phishing at the DNS layer"
+description = "A high-performance DNS proxy with threat intelligence, Shannon-entropy tunneling detection, and Prometheus metrics"
 authors = ["Joel Libni <kakarot.joel@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/kakarot-dev/dnsink"
+homepage = "https://github.com/kakarot-dev/dnsink"
+documentation = "https://docs.rs/dnsink"
+readme = "README.md"
+keywords = ["dns", "proxy", "security", "malware", "threat-intelligence"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

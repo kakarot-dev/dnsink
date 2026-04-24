@@ -45,3 +45,11 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  publish-dry-run:
+    name: Publish Dry-Run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --dry-run --allow-dirty
