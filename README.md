@@ -2,7 +2,7 @@
 
 A high-performance Rust DNS proxy that blocks malware, C2, and phishing domains at the DNS layer using live threat-intelligence feeds. Shannon-entropy tunneling detection with CDN whitelisting, DoH upstream, hot-reload, Prometheus metrics, terminal dashboard.
 
-[![CI](https://github.com/kakarot-dev/dnsink/actions/workflows/ci.yml/badge.svg)](https://github.com/kakarot-dev/dnsink/actions/workflows/ci.yml) [![Docker](https://img.shields.io/badge/ghcr.io-dnsink-blue?logo=docker)](https://github.com/kakarot-dev/dnsink/pkgs/container/dnsink) [![Deploy with flyctl](https://img.shields.io/badge/deploy%20with-flyctl-7b3fbf?logo=flydotio&logoColor=white)](https://fly.io/docs/launch/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/dnsink.svg)](https://crates.io/crates/dnsink) [![CI](https://github.com/kakarot-dev/dnsink/actions/workflows/ci.yml/badge.svg)](https://github.com/kakarot-dev/dnsink/actions/workflows/ci.yml) [![Docker](https://img.shields.io/badge/ghcr.io-dnsink-blue?logo=docker)](https://github.com/kakarot-dev/dnsink/pkgs/container/dnsink) [![Deploy with flyctl](https://img.shields.io/badge/deploy%20with-flyctl-7b3fbf?logo=flydotio&logoColor=white)](https://fly.io/docs/launch/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Contents
 
@@ -16,10 +16,19 @@ A high-performance Rust DNS proxy that blocks malware, C2, and phishing domains 
 
 ## Quickstart
 
+Install from crates.io:
+
+```sh
+cargo install dnsink
+dnsink --help
+```
+
+Or pull the Docker image:
+
 ```sh
 docker run -d --name dnsink \
   -p 53:5353/tcp -p 5353:5353/udp -p 9090:9090 \
-  ghcr.io/kakarot-dev/dnsink:v0.2.0
+  ghcr.io/kakarot-dev/dnsink:v0.2.1
 
 dig @127.0.0.1 +tcp example.com         # resolves
 dig @127.0.0.1 +tcp malware.example.com  # NXDOMAIN
