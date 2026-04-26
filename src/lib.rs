@@ -5,5 +5,6 @@ pub mod entropy;
 pub mod feeds;
 pub mod metrics_server;
 pub mod proxy;
+pub mod ratelimit;
 pub mod trie;
 pub mod tui;
