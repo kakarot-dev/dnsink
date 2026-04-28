@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufRead;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,8 +19,19 @@ use crate::cdn_whitelist::CdnWhitelist;
 use crate::config::{Config, UpstreamProtocol};
 use crate::entropy::EntropyDetector;
 use crate::feeds;
+use crate::ratelimit::{self, TokenBucket};
 use crate::trie::DomainTrie;
 use crate::tui::QueryEvent;
+
+/// Shared per-source rate-limit bucket map. One bucket per source IP.
+/// `std::sync::Mutex` is correct here: the critical section is purely
+/// synchronous (lookup + `try_acquire`) with no `.await` while held.
+pub type RateLimitMap = Arc<Mutex<HashMap<IpAddr, TokenBucket>>>;
+
+/// How often the sweep task wakes to evict idle full buckets.
+const RATELIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Buckets idle for this long are eligible for eviction (only if also full).
+const RATELIMIT_MAX_IDLE: Duration = Duration::from_secs(300);
 
 /// Maximum DNS message size with EDNS0 support
 const MAX_DNS_MSG_SIZE: usize = 4096;
@@ -33,6 +44,7 @@ pub struct QueryMetrics {
     pub allowed: AtomicU64,
     pub total_latency_ms: AtomicU64,
     pub tunneling_flagged: AtomicU64,
+    pub ratelimited: AtomicU64,
     blocked_domains: Mutex<HashMap<String, u64>>,
 }
 
@@ -50,6 +62,7 @@ impl QueryMetrics {
             allowed: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
             tunneling_flagged: AtomicU64::new(0),
+            ratelimited: AtomicU64::new(0),
             blocked_domains: Mutex::new(HashMap::new()),
         }
     }
@@ -58,6 +71,12 @@ impl QueryMetrics {
     /// detector marks a query as suspicious.
     fn record_tunneling_flag(&self) {
         self.tunneling_flagged.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the rate-limited counter. Called when a query is
+    /// silently dropped by the per-source token bucket.
+    fn record_ratelimited(&self) {
+        self.ratelimited.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record(&self, action: &str, latency_ms: u64, domain: &str) {
@@ -99,6 +118,7 @@ impl QueryMetrics {
             allowed: self.allowed.load(Ordering::Relaxed),
             total_latency_ms: self.total_latency_ms.load(Ordering::Relaxed),
             tunneling_flagged: self.tunneling_flagged.load(Ordering::Relaxed),
+            ratelimited: self.ratelimited.load(Ordering::Relaxed),
         }
     }
 }
@@ -111,6 +131,7 @@ pub struct MetricsSnapshot {
     pub allowed: u64,
     pub total_latency_ms: u64,
     pub tunneling_flagged: u64,
+    pub ratelimited: u64,
 }
 
 impl MetricsSnapshot {
@@ -165,6 +186,10 @@ pub struct DnsProxy {
     /// provider configured. Used to suppress entropy false positives on
     /// trusted CDNs before the entropy check runs.
     cdn_whitelist: Option<Arc<CdnWhitelist>>,
+    /// Shared per-source rate-limit map. Present only when
+    /// `config.ratelimit.enabled` is true. The accompanying sweep task
+    /// is spawned in `run()`.
+    ratelimit_buckets: Option<RateLimitMap>,
 }
 
 impl DnsProxy {
@@ -190,6 +215,11 @@ impl DnsProxy {
         } else {
             None
         };
+        let ratelimit_buckets = if config.ratelimit.enabled {
+            Some(Arc::new(Mutex::new(HashMap::new())))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             blocklist: Arc::new(ArcSwap::from_pointee(Blocklist { bloom, trie })),
@@ -198,6 +228,7 @@ impl DnsProxy {
             event_tx: None,
             entropy_detector,
             cdn_whitelist,
+            ratelimit_buckets,
         })
     }
 
@@ -237,6 +268,25 @@ impl DnsProxy {
             info!(interval_secs = refresh_secs, "hot-reload task started");
         }
 
+        // Spawn rate-limit sweep task — keeps the per-source bucket map
+        // bounded by evicting idle full buckets.
+        if let Some(buckets) = &self.ratelimit_buckets {
+            let buckets = buckets.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(RATELIMIT_SWEEP_INTERVAL);
+                tick.tick().await; // skip immediate first tick
+                loop {
+                    tick.tick().await;
+                    ratelimit::sweep(&buckets, RATELIMIT_MAX_IDLE);
+                }
+            });
+            info!(
+                interval_secs = RATELIMIT_SWEEP_INTERVAL.as_secs(),
+                max_idle_secs = RATELIMIT_MAX_IDLE.as_secs(),
+                "rate-limit sweep task started"
+            );
+        }
+
         let config = self.config.clone();
         let blocklist = self.blocklist.clone();
         let http = self.http.clone();
@@ -244,6 +294,7 @@ impl DnsProxy {
         let event_tx = self.event_tx.clone();
         let entropy_detector = self.entropy_detector.clone();
         let cdn_whitelist = self.cdn_whitelist.clone();
+        let ratelimit_buckets = self.ratelimit_buckets.clone();
         let udp_handle = tokio::spawn(async move {
             if let Err(e) = Self::run_udp(
                 udp_socket,
@@ -254,6 +305,7 @@ impl DnsProxy {
                 &event_tx,
                 entropy_detector.as_deref(),
                 cdn_whitelist.as_deref(),
+                ratelimit_buckets.as_ref(),
             )
             .await
             {
@@ -328,14 +380,40 @@ impl DnsProxy {
         event_tx: &Option<mpsc::Sender<QueryEvent>>,
         entropy_detector: Option<&EntropyDetector>,
         cdn_whitelist: Option<&CdnWhitelist>,
+        ratelimit_buckets: Option<&RateLimitMap>,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DNS_MSG_SIZE];
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         // Bind a single forwarding socket upfront, reused across all queries
         let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
+        // Refill rate is requests-per-minute spread across 60s; capacity
+        // is the burst budget. Both come from config and never change at
+        // runtime (no hot-reload of rate-limit shape for now).
+        let rl_refill = f64::from(config.ratelimit.requests_per_minute) / 60.0;
+        let rl_burst = config.ratelimit.burst;
+
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
+
+            // Rate-limit check before any parsing or blocklist work.
+            // Silent drop on deny — no response packet leaves the box,
+            // which is the only choice with zero amplification factor.
+            if let Some(buckets) = ratelimit_buckets {
+                let allowed = {
+                    let mut guard = buckets.lock().expect("ratelimit map mutex poisoned");
+                    let bucket = guard
+                        .entry(src.ip())
+                        .or_insert_with(|| TokenBucket::new(rl_burst, rl_refill));
+                    bucket.try_acquire()
+                };
+                if !allowed {
+                    metrics.record_ratelimited();
+                    debug!(src = %src, "rate-limited (silent drop)");
+                    continue;
+                }
+            }
+
             let query_data = buf[..len].to_vec();
             let start = Instant::now();
 

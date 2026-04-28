@@ -19,6 +19,36 @@ pub struct Config {
     pub tunneling_detection: TunnelingDetectionConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub ratelimit: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_requests_per_minute")]
+    pub requests_per_minute: u32,
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+fn default_requests_per_minute() -> u32 {
+    60
+}
+
+fn default_burst() -> u32 {
+    30
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_minute: default_requests_per_minute(),
+            burst: default_burst(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,6 +238,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             tunneling_detection: TunnelingDetectionConfig::default(),
             metrics: MetricsConfig::default(),
+            ratelimit: RateLimitConfig::default(),
         }
     }
 }

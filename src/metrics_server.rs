@@ -87,12 +87,16 @@ fn format_metrics(s: &MetricsSnapshot) -> String {
             "# HELP dnsink_tunneling_flagged_total Queries flagged as DNS tunneling candidates\n",
             "# TYPE dnsink_tunneling_flagged_total counter\n",
             "dnsink_tunneling_flagged_total {tunneling}\n",
+            "# HELP dnsink_ratelimited_total Queries silently dropped by the per-source rate limiter\n",
+            "# TYPE dnsink_ratelimited_total counter\n",
+            "dnsink_ratelimited_total {ratelimited}\n",
         ),
         total = s.total,
         blocked = s.blocked,
         allowed = s.allowed,
         latency = s.total_latency_ms,
         tunneling = s.tunneling_flagged,
+        ratelimited = s.ratelimited,
     )
 }
 
@@ -101,13 +105,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_contains_all_five_metric_names() {
+    fn format_contains_all_metric_names() {
         let snap = MetricsSnapshot {
             total: 0,
             blocked: 0,
             allowed: 0,
             total_latency_ms: 0,
             tunneling_flagged: 0,
+            ratelimited: 0,
         };
         let body = format_metrics(&snap);
         for name in [
@@ -116,6 +121,7 @@ mod tests {
             "dnsink_queries_allowed_total",
             "dnsink_query_latency_ms_total",
             "dnsink_tunneling_flagged_total",
+            "dnsink_ratelimited_total",
         ] {
             assert!(body.contains(name), "missing metric: {name}\n{body}");
             assert!(body.contains(&format!("# TYPE {name} counter")));
@@ -131,6 +137,7 @@ mod tests {
             allowed: 35,
             total_latency_ms: 1234,
             tunneling_flagged: 3,
+            ratelimited: 9,
         };
         let body = format_metrics(&snap);
         assert!(body.contains("\ndnsink_queries_total 42\n"));
@@ -138,5 +145,6 @@ mod tests {
         assert!(body.contains("\ndnsink_queries_allowed_total 35\n"));
         assert!(body.contains("\ndnsink_query_latency_ms_total 1234\n"));
         assert!(body.contains("\ndnsink_tunneling_flagged_total 3\n"));
+        assert!(body.contains("\ndnsink_ratelimited_total 9\n"));
     }
 }

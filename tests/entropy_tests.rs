@@ -92,6 +92,7 @@ fn tunneling_test_config(listen_port: u16, upstream_port: u16) -> Config {
             },
         },
         metrics: Default::default(),
+        ratelimit: Default::default(),
     }
 }
 

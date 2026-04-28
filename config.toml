@@ -32,3 +32,11 @@ providers = ["aws", "akamai", "cloudflare"]
 [metrics]
 enabled = true
 bind_addr = "127.0.0.1:9090"
+
+# Per-source-IP rate limiter. Off by default — enable when exposing the
+# resolver beyond a trusted LAN. Denied queries are silently dropped
+# (zero amplification) and counted via dnsink_ratelimited_total.
+[ratelimit]
+enabled = false
+requests_per_minute = 60
+burst = 30

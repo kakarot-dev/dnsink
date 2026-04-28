@@ -39,3 +39,12 @@ providers = ["aws", "akamai", "cloudflare"]
 [metrics]
 enabled = true
 bind_addr = "[::]:9090"
+
+# Per-source rate limiter — on by default in the container image since
+# the typical deployment is internet-exposed. Bucket = requests_per_minute
+# tokens accruing at a steady rate of rpm/60 per second, with burst as the
+# instantaneous capacity. Deny is a silent UDP drop.
+[ratelimit]
+enabled = true
+requests_per_minute = 120
+burst = 60

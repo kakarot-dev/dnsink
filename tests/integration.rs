@@ -62,6 +62,7 @@ fn test_config(port: u16) -> Config {
         logging: LoggingConfig::default(),
         tunneling_detection: Default::default(),
         metrics: Default::default(),
+        ratelimit: Default::default(),
     }
 }
 
