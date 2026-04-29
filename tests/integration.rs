@@ -8,7 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use dnsink::bloom::BloomFilter;
-use dnsink::config::{Config, FeedsConfig, ListenConfig, LoggingConfig, UpstreamConfig};
+use dnsink::config::{
+    Config, FeedsConfig, ListenConfig, LoggingConfig, RateLimitConfig, UpstreamConfig,
+};
 use dnsink::proxy::DnsProxy;
 use dnsink::trie::DomainTrie;
 
@@ -223,4 +225,61 @@ async fn metrics_update_after_queries() {
 
     let top = metrics.top_blocked(10);
     assert_eq!(top.len(), 2);
+}
+
+/// Burst beyond the rate-limit capacity. Confirms three properties at once:
+///   1. exactly `burst` responses come back (the rest are silently dropped),
+///   2. `dnsink_ratelimited_total` increments by `over_burst`,
+///   3. denied packets never produce a response packet.
+///
+/// Rate shape: 60 rpm = 1 tok/s refill, burst = 2. We send 5 queries
+/// back-to-back (under 10 ms total) so refill (≈ 0.0167 tok in that window)
+/// can't materially top the bucket up between sends.
+#[tokio::test]
+async fn udp_rate_limit_silently_drops_excess_and_increments_counter() {
+    use std::sync::atomic::Ordering;
+
+    let port = free_port();
+    let mut config = test_config(port);
+    config.ratelimit = RateLimitConfig {
+        enabled: true,
+        requests_per_minute: 60,
+        burst: 2,
+    };
+
+    let (bloom, trie) = test_blocklist();
+    let proxy = DnsProxy::new(config, bloom, trie).unwrap();
+    let metrics = proxy.metrics();
+    tokio::spawn(async move { proxy.run().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("127.0.0.1:{port}");
+    let query = make_query("evil.com");
+
+    for _ in 0..5 {
+        client.send_to(&query, &target).await.unwrap();
+    }
+
+    // Drain — expect exactly 2 responses, then a timeout (silent drops).
+    let mut got = 0;
+    let mut buf = vec![0u8; 4096];
+    while got < 5 {
+        match tokio::time::timeout(Duration::from_millis(300), client.recv(&mut buf)).await {
+            Ok(Ok(_)) => got += 1,
+            _ => break,
+        }
+    }
+
+    assert_eq!(got, 2, "expected exactly burst=2 responses, got {got}");
+    assert_eq!(
+        metrics.ratelimited.load(Ordering::Relaxed),
+        3,
+        "5 sends − burst 2 = 3 silently dropped",
+    );
+    assert_eq!(
+        metrics.blocked.load(Ordering::Relaxed),
+        2,
+        "the two allowed-through queries hit the blocklist (evil.com)",
+    );
 }
