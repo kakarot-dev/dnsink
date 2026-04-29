@@ -320,6 +320,7 @@ impl DnsProxy {
         let event_tx = self.event_tx.clone();
         let entropy_detector = self.entropy_detector.clone();
         let cdn_whitelist = self.cdn_whitelist.clone();
+        let tcp_ratelimit_buckets = self.ratelimit_buckets.clone();
         let tcp_handle = tokio::spawn(async move {
             if let Err(e) = Self::run_tcp(
                 tcp_listener,
@@ -330,6 +331,7 @@ impl DnsProxy {
                 event_tx,
                 entropy_detector,
                 cdn_whitelist,
+                tcp_ratelimit_buckets,
             )
             .await
             {
@@ -484,14 +486,39 @@ impl DnsProxy {
         event_tx: Option<mpsc::Sender<QueryEvent>>,
         entropy_detector: Option<Arc<EntropyDetector>>,
         cdn_whitelist: Option<Arc<CdnWhitelist>>,
+        ratelimit_buckets: Option<RateLimitMap>,
     ) -> anyhow::Result<()> {
         let use_doh = config.upstream.protocol == UpstreamProtocol::Doh;
         let doh_url = config.doh_url().to_string();
         let event_tx = Arc::new(event_tx);
         // Shared forwarding socket for UDP-first upstream, reused across connections
         let fwd_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        // Rate-limit shape — same source-of-truth as the UDP path.
+        let rl_refill = f64::from(config.ratelimit.requests_per_minute) / 60.0;
+        let rl_burst = config.ratelimit.burst;
         loop {
             let (stream, src) = listener.accept().await?;
+
+            // Rate-limit on accept, before spawning a per-connection task.
+            // A denied accept costs zero further work; we drop the stream
+            // (silent close) rather than write any DNS response, mirroring
+            // the UDP path's silent-drop semantics.
+            if let Some(buckets) = ratelimit_buckets.as_ref() {
+                let allowed = {
+                    let mut guard = buckets.lock().expect("ratelimit map mutex poisoned");
+                    let bucket = guard
+                        .entry(src.ip())
+                        .or_insert_with(|| TokenBucket::new(rl_burst, rl_refill));
+                    bucket.try_acquire()
+                };
+                if !allowed {
+                    metrics.record_ratelimited();
+                    debug!(src = %src, "rate-limited tcp accept (silent drop)");
+                    drop(stream);
+                    continue;
+                }
+            }
+
             let timeout = Duration::from_millis(config.upstream.timeout_ms);
             let upstream_addr = if use_doh {
                 None
