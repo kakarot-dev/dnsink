@@ -157,8 +157,14 @@ mod tests {
         sweep(&map, Duration::from_secs(60));
 
         let guard = map.lock().unwrap();
-        assert!(!guard.contains_key("idle-full"), "idle full bucket should be evicted");
-        assert!(guard.contains_key("active"), "recently-touched bucket must remain");
+        assert!(
+            !guard.contains_key("idle-full"),
+            "idle full bucket should be evicted"
+        );
+        assert!(
+            guard.contains_key("active"),
+            "recently-touched bucket must remain"
+        );
         assert!(
             guard.contains_key("drained"),
             "drained-but-old bucket must remain — it still carries state"
