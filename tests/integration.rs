@@ -227,6 +227,109 @@ async fn metrics_update_after_queries() {
     assert_eq!(top.len(), 2);
 }
 
+/// Happy-path counterpart to the burst test below. Sends a single query well
+/// within the rate-limit budget — confirms the limiter is wired but not
+/// triggered, the response comes back, and `dnsink_ratelimited_total`
+/// stays at zero.
+#[tokio::test]
+async fn udp_rate_limit_does_not_drop_when_under_capacity() {
+    use std::sync::atomic::Ordering;
+
+    let port = free_port();
+    let mut config = test_config(port);
+    config.ratelimit = RateLimitConfig {
+        enabled: true,
+        requests_per_minute: 60,
+        burst: 5,
+    };
+
+    let (bloom, trie) = test_blocklist();
+    let proxy = DnsProxy::new(config, bloom, trie).unwrap();
+    let metrics = proxy.metrics();
+    tokio::spawn(async move { proxy.run().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(&make_query("evil.com"), format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let len = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("timeout — query under burst should always come back")
+        .unwrap();
+
+    let response = Message::from_bytes(&buf[..len]).unwrap();
+    assert_eq!(response.response_code(), ResponseCode::NXDomain);
+    assert_eq!(
+        metrics.ratelimited.load(Ordering::Relaxed),
+        0,
+        "single query within burst must not increment the limiter counter",
+    );
+    assert_eq!(metrics.blocked.load(Ordering::Relaxed), 1);
+}
+
+/// TCP variant of the burst test. The TCP rate-limit check fires on `accept`,
+/// before spawning the per-connection task; denied accepts drop the stream so
+/// the client sees EOF on its read. We open 5 TCP connections back-to-back
+/// (under the 1 tok/s refill window), expect exactly 2 to receive a DNS
+/// response, and the remaining 3 to fail at `read_u16` (EOF / closed by peer).
+#[tokio::test]
+async fn tcp_rate_limit_silently_closes_excess_connections() {
+    use std::sync::atomic::Ordering;
+
+    let port = free_port();
+    let mut config = test_config(port);
+    config.ratelimit = RateLimitConfig {
+        enabled: true,
+        requests_per_minute: 60,
+        burst: 2,
+    };
+
+    let (bloom, trie) = test_blocklist();
+    let proxy = DnsProxy::new(config, bloom, trie).unwrap();
+    let metrics = proxy.metrics();
+    tokio::spawn(async move { proxy.run().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let target = format!("127.0.0.1:{port}");
+    let query = make_query("evil.com");
+    let len_bytes = (query.len() as u16).to_be_bytes();
+
+    let mut completed = 0;
+    let mut closed = 0;
+    for _ in 0..5 {
+        let mut stream = tokio::net::TcpStream::connect(&target).await.unwrap();
+        // Best-effort write — server may have already dropped the stream.
+        let _ = stream.write_all(&len_bytes).await;
+        let _ = stream.write_all(&query).await;
+        match tokio::time::timeout(Duration::from_millis(500), stream.read_u16()).await {
+            Ok(Ok(_)) => completed += 1,
+            // EOF / broken pipe / connection reset — server dropped on accept.
+            Ok(Err(_)) => closed += 1,
+            // Timeout shouldn't happen with the silent-close path; treat as a
+            // closed conn for accounting so a flaky CI doesn't false-fail.
+            Err(_) => closed += 1,
+        }
+    }
+
+    assert_eq!(
+        completed, 2,
+        "expected exactly burst=2 connections to receive responses, got {completed}",
+    );
+    assert_eq!(
+        closed, 3,
+        "expected 3 connections to be silently closed by the limiter, got {closed}",
+    );
+    assert_eq!(
+        metrics.ratelimited.load(Ordering::Relaxed),
+        3,
+        "5 connects − burst 2 = 3 silently dropped",
+    );
+}
+
 /// Burst beyond the rate-limit capacity. Confirms three properties at once:
 ///   1. exactly `burst` responses come back (the rest are silently dropped),
 ///   2. `dnsink_ratelimited_total` increments by `over_burst`,
