@@ -1,6 +1,6 @@
 [package]
 name = "dnsink"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "A high-performance DNS proxy with threat intelligence, Shannon-entropy tunneling detection, and Prometheus metrics"
 authors = ["Joel Libni <kakarot.joel@gmail.com>"]
